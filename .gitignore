@@ -1,0 +1,9 @@
+node_modules/
+log/
+.tmp-test/
+*.tmp-test*
+nul
+state.json
+*.exe
+sea.bin
+*.log

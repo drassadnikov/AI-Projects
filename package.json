@@ -1,0 +1,23 @@
+{
+  "name": "gpu-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Онлайн-мониторинг NVIDIA GPU (RTX 3090 Ti): загрузка, температура, мощность, частота, VRAM, вентилятор, процессы + управление LLM-моделью с живым логом",
+  "main": "gpu-monitor.js",
+  "scripts": {
+    "start": "node gpu-monitor.js",
+    "console": "node gpu-monitor.js --console",
+    "build:exe": "node build-exe.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "node-pty": "^1.1.0",
+    "puppeteer-core": "^25.12.0"
+  },
+  "devDependencies": {
+    "postject": "^1.0.0-alpha.6"
+  }
+}

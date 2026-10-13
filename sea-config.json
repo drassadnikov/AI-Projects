@@ -1,0 +1,5 @@
+{
+  "main": "launcher.js",
+  "output": "sea.bin",
+  "disableExperimentalSEA": true
+}
