@@ -1,23 +1,25 @@
 {
-  "name": "gpu-monitor",
+  "name": "docxpdfwork",
   "version": "1.0.0",
-  "private": true,
-  "description": "Онлайн-мониторинг NVIDIA GPU (RTX 3090 Ti): загрузка, температура, мощность, частота, VRAM, вентилятор, процессы + управление LLM-моделью с живым логом",
-  "main": "gpu-monitor.js",
+  "description": "Конвертер PDF/DOCX в Markdown-заметки (Obsidian)",
+  "main": "build-docx2.cjs",
   "scripts": {
-    "start": "node gpu-monitor.js",
-    "console": "node gpu-monitor.js --console",
-    "build:exe": "node build-exe.js"
+    "extract": "node extract.mjs",
+    "build:pdf": "node build.mjs",
+    "build:docx": "node build-docx2.cjs"
   },
-  "engines": {
-    "node": ">=18"
-  },
+  "keywords": [
+    "pdf",
+    "docx",
+    "markdown",
+    "mupdf",
+    "ooxml"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
   "dependencies": {
-    "jpeg-js": "^0.4.4",
-    "node-pty": "^1.1.0",
-    "puppeteer-core": "^25.12.0"
-  },
-  "devDependencies": {
-    "postject": "^1.0.0-alpha.6"
+    "adm-zip": "^0.6.1",
+    "mupdf": "^1.28.1"
   }
 }
