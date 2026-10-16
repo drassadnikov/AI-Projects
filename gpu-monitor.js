@@ -349,6 +349,106 @@ class HotspotPoller {
 
 
 /**
+ * Секундомер времени выполнения запроса.
+ *
+ * Логика: стартует по строке «HTTP request» (промпт отправлен в LLM),
+ * останавливается, когда pi перестал работать (спиннер «Working» исчез
+ * и не появляется PI_IDLE_CONFIRM_MS подряд).
+ *
+ * Важно: пока в pi крутится статус «Working» (спиннер), время НЕ сбрасывается.
+ * Один «запрос» в pi — это целый агентный ход: несколько вызовов LLM и
+ * инструментов. Промежуточные строки «total time» / «processing task»
+ * цикл не перезапускают: он идёт от первого запроса хода до момента,
+ * когда pi полностью станет idle.
+ *
+ * Защита от мерцания: pi считается «неактивным» только если спиннер не
+ * обнаруживался PI_IDLE_CONFIRM_MS подряд. Кратковременные провалы кадров
+ * спиннера (буферизация pty, редкие паузы отрисовки TUI) цикл не завершают.
+ *
+ * Сигналы приходят из двух независимых источников:
+ *  - LlmManager: onRequestStart / onResponseReceived (по строкам лога LLM);
+ *  - PtyTerm:    onPiStatus (по наличию спиннера в выводе pi).
+ *
+ * state().elapsedMs — живое значение «по часам» для тикающего отображения,
+ * state().lastMs — итог после остановки.
+ */
+const PI_IDLE_CONFIRM_MS = 1500; // pi idle дольше — ход завершён
+class RequestTimer {
+  constructor() {
+    this.running = false;
+    this.startTs = null;
+    this.lastMs = null;
+    this.responseReceived = false;
+    this.piWorking = false;
+    this._idleSince = null; // момент, когда pi перестал работать (подтверждение idle)
+    this._idleTimer = setInterval(() => this._checkIdle(), 200);
+    if (this._idleTimer.unref) this._idleTimer.unref();
+  }
+  /** Сброс цикла запроса (статус pi не трогаем — это текущее состояние pi). */
+  reset() {
+    this.running = false;
+    this.startTs = null;
+    this.lastMs = null;
+    this.responseReceived = false;
+    this._idleSince = null;
+  }
+  /** Строка «HTTP request» — промпт отправлен в LLM. */
+  onRequestStart(ts) {
+    if (this.running) return; // цикл уже идёт (несколько вызовов LLM с инструментами)
+    this.running = true;
+    this.startTs = ts;
+    this.responseReceived = false;
+    this.lastMs = null;
+    this._idleSince = null;
+  }
+  /** Строка «total time» — ответ LLM получен (промежуточный или финальный). */
+  onResponseReceived() {
+    if (!this.running) return;
+    this.responseReceived = true;
+    this._checkIdle(); // если pi уже idle — завершим цикл
+  }
+  /** Смена статуса pi (working/thinking — спиннер в терминале). */
+  onPiStatus(working) {
+    this.piWorking = working;
+    if (working) {
+      // pi снова работает — отменяем подтверждение idle.
+      this._idleSince = null;
+    } else if (this.running && this._idleSince == null) {
+      // pi перестал работать — начинаем отсчёт подтверждения idle.
+      // Цикл НЕ завершаем сразу: спиннер мог просто моргнуть, а время
+      // запроса сбрасывать нельзя, пока pi работает.
+      this._idleSince = Date.now();
+    }
+  }
+  /** Завершить цикл, только если pi idle не меньше PI_IDLE_CONFIRM_MS. */
+  _checkIdle() {
+    if (this.running && !this.piWorking && this._idleSince != null
+        && Date.now() - this._idleSince >= PI_IDLE_CONFIRM_MS) {
+      this._finish();
+    }
+  }
+  _finish() {
+    if (!this.running) return;
+    this.running = false;
+    this.lastMs = Date.now() - this.startTs;
+    this.startTs = null;
+    this._idleSince = null;
+  }
+  state() {
+    this._checkIdle(); // state() тоже подтверждает idle
+    const now = Date.now();
+    return {
+      running: this.running,
+      startTs: this.startTs,
+      elapsedMs: this.running && this.startTs != null ? now - this.startTs : null,
+      lastMs: this.lastMs,
+      responseReceived: this.responseReceived,
+      piWorking: this.piWorking,
+    };
+  }
+}
+
+/**
  * Управление LLM-моделью: запуск/остановка батника + живой буфер лога.
  */
 class LlmManager {
@@ -357,6 +457,7 @@ class LlmManager {
     this.batPath = batPath;
     this.maxLines = opts.maxLines || 5000;
     this.onPersist = opts.onPersist || null;
+    this.timer = opts.timer || null; // RequestTimer — секундомер времени выполнения запроса
     this.proc = null;
     this._stopRequested = false;
     this.running = false;
@@ -366,8 +467,15 @@ class LlmManager {
     this.lines = [];
     this._partial = { out: '', err: '' };
     this.genPoints = []; // точки {n, t} по строкам «n_gen = N» для средней скорости
+    this.promptPoints = []; // точки {n, ms, t} по строкам «prompt eval time» для средней скорости промпта
+    this._reqStartTs = null; // метка строки «HTTP request» — момент отправки промпта
     this.ctxTokens = null; // текущее использование контекста (n_tokens из «release»-строк)
     this.ctxLimit = null;  // лимит контекста (n_ctx_slot)
+    this.lastRequestMs = null; // время последнего запроса, мс («total time» из лога llama-server)
+    // Кэшированные «последние» значения: сохраняются после завершения запроса
+    // и не очищаются, пока модель не перезапустят (см. start()).
+    this.lastPromptTps = null;
+    this.lastGenTps = null;
   }
 
   /** Сменить батник (с проверкой файла). Применяется с следующего запуска. */
@@ -389,8 +497,11 @@ class LlmManager {
       // Средняя скорость генерации по строкам лога «n_gen = N»:
       // (N_конец − N_начало) / Δt в окне последних ~60 с.
       tokensPerSec: this._genTps(),
+      promptTokensPerSec: this._promptTps(),
       ctxTokens: this.ctxTokens,
       ctxLimit: this.ctxLimit,
+      lastRequestMs: this.lastRequestMs,
+      reqTimer: this.timer ? this.timer.state() : null,
       bat: this.batPath,
       batExists: fs.existsSync(this.batPath),
       logCount: this.lines.length,
@@ -398,9 +509,13 @@ class LlmManager {
   }
 
   pushLine(stream, text) {
-    this.lines.push({ id: this.nextId++, ts: Date.now(), stream, text });
+    const ts = Date.now();
+    this.lines.push({ id: this.nextId++, ts, stream, text });
     this._parseCtx(text);
     this._parseGen(text);
+    this._parsePrompt(text);
+    this._parseReqStart(text, ts);
+    this._parseReqTime(text, ts);
     if (this.lines.length > this.maxLines) {
       this.lines.splice(0, this.lines.length - this.maxLines);
     }
@@ -420,15 +535,18 @@ class LlmManager {
     while (this.genPoints.length > 1 && now - this.genPoints[0].t > 60000) this.genPoints.shift();
   }
 
-  /** Средняя скорость генерации (токенов/с) по окну последних строк «n_gen». */
+  /** Средняя скорость генерации (токенов/с) по окну последних строк «n_gen».
+   *  Кэширует последнее вычисленное значение (lastGenTps), чтобы после
+   *  завершения запроса оно не очищалось, пока модель не перезапустят. */
   _genTps() {
     const p = this.genPoints;
-    if (p.length < 2) return null;
-    const first = p[0];
-    const last = p[p.length - 1];
-    const dt = (last.t - first.t) / 1000;
-    if (dt < 1) return null; // окно меньше секунды — среднее пока недостоверно
-    return (last.n - first.n) / dt;
+    if (p.length >= 2) {
+      const first = p[0];
+      const last = p[p.length - 1];
+      const dt = (last.t - first.t) / 1000;
+      if (dt >= 1) this.lastGenTps = (last.n - first.n) / dt; // окно < 1 с — среднее недостоверно
+    }
+    return this.lastGenTps;
   }
 
 
@@ -438,6 +556,57 @@ class LlmManager {
     if (m) this.ctxLimit = Number(m[1]);
     m = /n_tokens\s*=\s*(\d+),\s*truncated/.exec(text);
     if (m) this.ctxTokens = Number(m[1]);
+  }
+
+  /** Строка llama-server — момент начала обработки запроса (отправка промпта).
+   *  В новых сборках llama.cpp строки «HTTP request: POST …» больше нет в логе —
+   *  вместо неё маркером начала задачи является строка
+   *  «launch_slot_: … processing task, is_child = 0». Проверяем оба формата. */
+  _parseReqStart(text, ts) {
+    if (/HTTP request: POST \/v1\/(chat\/)?completions|HTTP request: POST \/completion|processing task, is_child/.test(text)) {
+      if (this._reqStartTs == null) this._reqStartTs = ts;
+      if (this.timer) this.timer.onRequestStart(ts);
+    }
+  }
+
+  /** Строка llama-server: «total time = X ms / N tokens» — запрос завершён.
+   *  Время выполнения замеряется по «часам» от строки начала запроса (отправка промпта)
+   *  до этой строки (ответ получен, обработка завершена); без строки запроса — значение из лога. */
+  _parseReqTime(text, ts) {
+    const m = /total time\s*=\s*([\d.]+)\s*ms/.exec(text);
+    if (!m) return;
+    if (this.timer) this.timer.onResponseReceived();
+    const start = this._reqStartTs;
+    this._reqStartTs = null;
+    this.lastRequestMs = (start != null && ts - start > 0) ? ts - start : Number(m[1]);
+  }
+
+  /** Строка llama-server: «prompt eval time = X ms / N tokens» — обработка промпта.
+   *  Собираем точки {n, ms, t} для средней скорости (окно ~60 с). */
+  _parsePrompt(text) {
+    const m = /prompt eval time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens/.exec(text);
+    if (!m) return;
+    const now = Date.now();
+    this.promptPoints.push({ n: Number(m[2]), ms: Number(m[1]), t: now });
+    while (this.promptPoints.length > 1 && now - this.promptPoints[0].t > 60000) this.promptPoints.shift();
+  }
+
+  /** Средняя скорость обработки промпта (токенов/с): среднее по строкам
+   *  «prompt eval time» в окне последних ~60 с. Каждая строка даёт свою скорость
+   *  (n / (ms/1000)); берём арифметическое среднее этих значений. Кэшируем
+   *  последнее вычисленное значение (lastPromptTps), чтобы после завершения
+   *  запроса оно не очищалось, пока модель не перезапустят. */
+  _promptTps() {
+    const now = Date.now();
+    const speeds = [];
+    for (const p of this.promptPoints) {
+      if (now - p.t > 60000) continue;
+      if (p.ms > 0) speeds.push(p.n / (p.ms / 1000));
+    }
+    if (speeds.length) {
+      this.lastPromptTps = speeds.reduce((a, b) => a + b, 0) / speeds.length;
+    }
+    return this.lastPromptTps;
   }
 
   /** Строки с id > n. oldestId нужен клиенту, чтобы понять, что старые строки потеряны. */
@@ -474,8 +643,14 @@ class LlmManager {
     this._stopRequested = false;
     this._partial = { out: '', err: '' };
     this.genPoints = [];
+    this.promptPoints = [];
+    this._reqStartTs = null;
     this.ctxTokens = null;
     this.ctxLimit = null;
+    this.lastRequestMs = null;
+    this.lastPromptTps = null;
+    this.lastGenTps = null;
+    if (this.timer) this.timer.reset();
     if (this.onPersist) this.onPersist(this.batPath);
     this.pushLine('sys', 'Запуск: ' + this.batPath + ' (pid ' + cmd.pid + ')');
     cmd.stdout.on('data', (d) => this.onData('out', d));
@@ -526,6 +701,13 @@ class LlmManager {
 // вместо молчаливого промпта (PATH pty уже дополнен npm-каталогом в start()).
 const PI_AUTO_CMD =
   "if (Get-Command pi -ErrorAction SilentlyContinue) { pi --tui-mode fullscreen } else { Write-Host '[gpu-monitor] pi не найден в PATH. Установить: npm install -g @earendil-works/pi-coding-agent' -ForegroundColor Yellow }";
+
+// Брайлевые кадры спиннера pi (Loader из pi-tui). В TUI pi они используются
+// только в StatusIndicator (working/thinking/compaction/retry) — по их
+// наличию в выводе определяем, что pi «работает» (isStreaming/инструменты).
+// Кадры обновляются каждые ~80 мс, поэтому отсутствие кадров > 400 мс = pi idle.
+const PI_SPINNER_RE = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
+const PI_IDLE_MS = 400; // без кадров спиннера дольше — считаем pi неактивным
 class PtyTerm {
   constructor(cwd, opts) {
     opts = opts || {};
@@ -541,6 +723,11 @@ class PtyTerm {
     this._subs = new Set(); // ответы SSE
     this._history = []; // base64-чанки
     this._historySize = 0;
+    this.timer = null; // RequestTimer — получает статус pi (working/idle)
+    this._piWorking = false; // текущий статус pi: true — работает (спиннер виден)
+    this._lastSpinnerTs = 0; // время последнего кадра спиннера
+    this._piCheckTimer = null; // интервал детекции idle
+    this._spinDecoder = new TextDecoder('utf8'); // корректно склеивает разорванные кадры
   }
 
   state() {
@@ -554,6 +741,7 @@ class PtyTerm {
       exitCode: this.exitCode,
       stoppedByUser: !this.running && this._stopRequested,
       historyBytes: this._historySize,
+      piWorking: this._piWorking,
     };
   }
 
@@ -576,12 +764,63 @@ class PtyTerm {
   _onData(d) {
     const buf = Buffer.from(d);
     const b64 = buf.toString('base64');
+    this._scanSpinner(d);
     this._history.push(b64);
     this._historySize += buf.length;
     while (this._historySize > this.historyMax && this._history.length) {
       this._historySize -= Buffer.byteLength(Buffer.from(this._history.shift(), 'base64'));
     }
     this._emit(b64);
+  }
+
+  /** Подключить RequestTimer: статус pi (working/idle) будет передаваться в него. */
+  setTimer(t) {
+    this.timer = t || null;
+  }
+
+  /** Сканирует чанк вывода на кадры спиннера pi. Кадры обновляются каждые ~80 мс,
+   *  поэтому их наличие означает, что pi работает (working/thinking/инструменты). */
+  _scanSpinner(d) {
+    // node-pty в onData передаёт СТРОКУ (уже декодированную в UTF-8) —
+    // TextDecoder.decode(string) бросает ERR_INVALID_ARG_TYPE и убивает процесс.
+    // Buffer (если передан) декодируем через TextDecoder со stream:true —
+    // он корректно склеивает брайлевый кадр (3 байта UTF-8), разорванный
+    // по границе чанка, — иначе кадр терялся бы как U+FFFD.
+    const s = typeof d === 'string' ? d : this._spinDecoder.decode(d, { stream: true });
+    if (PI_SPINNER_RE.test(s)) {
+      this._lastSpinnerTs = Date.now();
+      if (!this._piWorking) {
+        this._piWorking = true;
+        if (this.timer) this.timer.onPiStatus(true);
+      }
+    }
+  }
+
+  /** Периодическая проверка: если спиннер не обновлялся дольше PI_IDLE_MS — pi idle. */
+  _piCheck() {
+    if (this._piWorking && Date.now() - this._lastSpinnerTs > PI_IDLE_MS) {
+      this._piWorking = false;
+      if (this.timer) this.timer.onPiStatus(false);
+    }
+  }
+
+  _piCheckStart() {
+    if (this._piCheckTimer) return;
+    this._piCheckTimer = setInterval(() => this._piCheck(), 150);
+  }
+
+  _piCheckStop() {
+    if (this._piCheckTimer) {
+      clearInterval(this._piCheckTimer);
+      this._piCheckTimer = null;
+    }
+  }
+
+  /** Установить статус pi и уведомить RequestTimer (если изменился). */
+  _piWorkingSet(working) {
+    if (this._piWorking === working) return;
+    this._piWorking = working;
+    if (this.timer) this.timer.onPiStatus(working);
   }
 
   start(cols, rows) {
@@ -611,11 +850,14 @@ class PtyTerm {
     this._stopRequested = false;
     this._history = [];
     this._historySize = 0;
+    this._piCheckStart();
     proc.onData((d) => this._onData(d));
     proc.onExit(({ exitCode }) => {
       this.running = false;
       this.exitCode = this._stopRequested ? -1 : exitCode;
       this.proc = null;
+      this._piCheckStop();
+      this._piWorkingSet(false);
       this._emit(JSON.stringify({ code: this.exitCode, stoppedByUser: this._stopRequested }), 'exit');
     });
     return proc.pid;
@@ -647,6 +889,8 @@ class PtyTerm {
     if (!this.running || !this.proc) return { ok: false, error: 'терминал не запущен' };
     const pid = this.proc.pid;
     this._stopRequested = true;
+    this._piCheckStop();
+    this._piWorkingSet(false);
     try {
       this.proc.kill();
     } catch (e) {
@@ -850,6 +1094,9 @@ $miExit = $ctx.Items.Add('Выход')
 $miExit.Add_Click({
   $ok = $false
   try { Invoke-WebRequest -Uri ($Url + 'api/shutdown') -Method POST -UseBasicParsing -TimeoutSec 5 | Out-Null; $ok = $true } catch {}
+  # Гарантированное завершение: убиваем ВСЕ gpu-monitor.exe (текущий и все дубли),
+  # даже если POST /api/shutdown не дошёл или сервер завис.
+  try { taskkill /F /IM gpu-monitor.exe /T 2>$null | Out-Null } catch {}
   if (-not $ok) {
     try { taskkill /F /IM llama-server.exe /T 2>$null | Out-Null } catch {}
     try { Stop-Process -Id $ParentPid -Force -ErrorAction SilentlyContinue } catch {}
@@ -904,6 +1151,17 @@ function killLlamaServers() {
     console.log(res.status === 0 ? 'llama-server.exe: остановлены все процессы' : 'llama-server.exe: запущенных процессов не найдено');
   } catch (e) {
     console.error('llama-server: ' + (e.message || e));
+  }
+}
+
+/** Останавливает ВСЕ процессы gpu-monitor.exe (текущий и все дубли). */
+function killGpuMonitors() {
+  if (process.platform !== 'win32') return;
+  try {
+    const res = spawnSync('taskkill', ['/F', '/IM', 'gpu-monitor.exe', '/T'], { windowsHide: true, timeout: 8000 });
+    console.log(res.status === 0 ? 'gpu-monitor.exe: остановлены все процессы' : 'gpu-monitor.exe: запущенных процессов не найдено');
+  } catch (e) {
+    console.error('gpu-monitor: ' + (e.message || e));
   }
 }
 
@@ -1005,6 +1263,8 @@ const PAGE = `<!doctype html>
   .log-col .llm-stats { margin-top: 10px; gap: 8px; }
   .log-col .llm-stats .card { padding: 10px 12px; }
   .log-col .llm-stats .card .value { font-size: 24px; }
+  .log-col .llm-stats .card.live { border-color: #1f6feb; box-shadow: 0 0 0 1px rgba(31,111,235,.35); }
+  .log-col .llm-stats .card.live .value { color: #58a6ff; }
 .log { background: #010409; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; height: 420px; overflow-y: auto; font-family: 'Cascadia Mono', Consolas, monospace; font-size: 16px; line-height: 1.19; }
   .log .l-out { color: #c9d1d9; white-space: pre-wrap; word-break: break-word; }
   .log .l-err { color: #7ec8f7; white-space: pre-wrap; word-break: break-word; }
@@ -1111,7 +1371,9 @@ const PAGE = `<!doctype html>
           <button id="btn-log-end" title="Прокрутить к последней строке и следовать за логом">⬇ К концу</button>
         </div>
         <div class="llm-stats">
-          <div class="card"><div class="label">Скорость, tok/s</div><div class="value" id="v-tokps">—</div><div class="unit">средняя · генерация (n_gen)</div></div>
+          <div class="card"><div class="label">Скорость обработки промпта</div><div class="value" id="v-promptps">—</div><div class="unit">tok/s · средняя · prompt eval</div></div>
+          <div class="card"><div class="label">Скорость генерации ответа</div><div class="value" id="v-tokps">—</div><div class="unit">tok/s · средняя · генерация (n_gen)</div></div>
+          <div class="card" id="card-reqtime"><div class="label">Время выполнения запроса</div><div class="value" id="v-reqtime">—</div><div class="unit" id="u-reqtime">мин:сек</div></div>
           <div class="card"><div class="label">Контекст</div><div class="value" id="v-ctx">—</div><div class="unit">токенов: занято / лимит</div></div>
         </div>
       </div>
@@ -1399,6 +1661,32 @@ const PAGE = `<!doctype html>
       .catch(function () {});
   }
 
+  // Секундомер времени выполнения запроса: живое значение «по часам» от startTs,
+  // тикает каждые 100 мс, пока запрос в работе; после остановки — итог (lastMs).
+  var lastReqTimer = null;
+  function fmtReqTime(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    return Math.floor(totalSec / 60) + ':' + String(totalSec % 60).padStart(2, '0');
+  }
+  function updateReqTimer(t) {
+    var el = document.getElementById('v-reqtime');
+    var card = document.getElementById('card-reqtime');
+    var unit = document.getElementById('u-reqtime');
+    if (!el) return;
+    // Время не сбрасываем, пока не исчезнет статус «pi Working»:
+    // показываем живое значение, пока запрос идёт (t.running), а после —
+    // замороженный итог (t.lastMs), который фиксируется в момент, когда
+    // pi перестаёт работать (piWorking → false).
+    if (t && t.running) {
+      card.className = 'card live';
+      el.textContent = fmtReqTime(Math.max(0, Date.now() - t.startTs));
+    } else {
+      card.className = 'card';
+      el.textContent = (t && t.lastMs != null) ? fmtReqTime(t.lastMs) : '—';
+    }
+    unit.textContent = 'мин:сек';
+  }
+
   function llmTick() {
     fetch('/api/llm')
       .then(function (r) { return r.json(); })
@@ -1420,8 +1708,11 @@ const PAGE = `<!doctype html>
         }
         document.getElementById('btn-start').disabled = d.running;
         document.getElementById('btn-stop').disabled = !d.running;
-        setText('bat-current', 'Текущий: ' + d.bat + (d.batExists ? '' : '  (ФАЙЛ НЕ НАЙДЕН)'));
+        setText('bat-current', 'Текущая: ' + d.bat + (d.batExists ? '' : '  (ФАЙЛ НЕ НАЙДЕН)'));
+        setText('v-promptps', d.promptTokensPerSec == null ? '—' : Number(d.promptTokensPerSec).toFixed(1));
         setText('v-tokps', d.tokensPerSec == null ? '—' : Number(d.tokensPerSec).toFixed(1));
+        lastReqTimer = d.reqTimer || null;
+        updateReqTimer(lastReqTimer);
         setText('v-ctx', d.ctxTokens == null ? '—' : fmtK(d.ctxTokens) + (d.ctxLimit ? ' / ' + fmtK(d.ctxLimit) : ''));
       })
       .catch(function () {});
@@ -1539,6 +1830,14 @@ const PAGE = `<!doctype html>
   fetch('/api/term')
     .then(function (r) { return r.json(); })
     .then(function (d) { if (!d.running) doTermStart(); })
+    .catch(function () {});
+
+  // Автозапуск LLM-модели: при запуске gpu-monitor.exe (открытии дашборда)
+  // запускаем модель, применённую в настройках окна (батник из state.json),
+  // если она ещё не запущена — симметрично автозапуску встроенного терминала.
+  fetch('/api/llm')
+    .then(function (r) { return r.json(); })
+    .then(function (d) { if (!d.running) doStart(); })
     .catch(function () {});
 
   // === Встроенный PowerShell (xterm.js + SSE) ===
@@ -1852,6 +2151,8 @@ const PAGE = `<!doctype html>
   llmTick();
   loadBats();
   setInterval(llmTick, 2000);
+  // Секундомер тикает чаще опроса /api/llm: живое значение «по часам» от startTs.
+  setInterval(function () { updateReqTimer(lastReqTimer); }, 100);
   logTick();
   setInterval(logTick, 1000);
   termTick();
@@ -2201,7 +2502,9 @@ function main() {
     console.log('Использую последний батник из ' + STATE_FILE + ': ' + initialBat);
   }
   opts.batsDir = opts.batsDir || path.dirname(initialBat);
+  const reqTimer = new RequestTimer(); // секундомер времени выполнения запроса
   const llm = new LlmManager(initialBat, {
+    timer: reqTimer,
     onPersist: (p) => {
       const s = loadState();
       s.lastBat = p;
@@ -2227,6 +2530,7 @@ function main() {
   });
 
   const term = new PtyTerm(opts.termCwd, {});
+  term.setTimer(reqTimer); // статус pi (working/idle) → секундомер
 
   // GUI-режим: exe запущен без консоли (окна нет) — приложение живёт в системном трее.
   const isTty = !!(process.stdout && process.stdout.isTTY);
@@ -2239,19 +2543,34 @@ function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log('Остановка (' + reason + ')…');
-    try { if (trayProc) trayProc.kill(); } catch {}
-    if (llm.running && llm.proc) llm.stop();
-    killLlamaServers();
-    if (term.running && term.proc) {
-      const tpid = term.proc.pid;
-      term.stop();
-      try { spawnSync('taskkill', ['/PID', String(tpid), '/T', '/F'], { windowsHide: true, timeout: 5000 }); } catch {}
+    // Каждый синхронный вызов (taskkill/wmic) ограничен своим таймаутом,
+    // поэтому cleanup не может зависнуть навсегда; страховка на 30 с —
+    // резерв на случай, если что-то из cleanup всё же не вернётся.
+    const safety = setTimeout(() => {
+      console.error('Остановка: cleanup завис — принудительный выход');
+      process.exit(0);
+    }, 30000);
+    safety.unref();
+    try {
+      try { if (trayProc) trayProc.kill(); } catch (e) { console.error('Остановка: trayProc.kill: ' + (e && e.message || e)); }
+      try { if (llm.running && llm.proc) llm.stop(); } catch (e) { console.error('Остановка: llm.stop: ' + (e && e.message || e)); }
+      try { killLlamaServers(); } catch (e) { console.error('Остановка: killLlamaServers: ' + (e && e.message || e)); }
+      try {
+        if (term.running && term.proc) {
+          const tpid = term.proc.pid;
+          term.stop();
+          spawnSync('taskkill', ['/PID', String(tpid), '/T', '/F'], { windowsHide: true, timeout: 5000 });
+        }
+      } catch (e) { console.error('Остановка: term.stop: ' + (e && e.message || e)); }
+      try { killSidePowerShell(); } catch (e) { console.error('Остановка: killSidePowerShell: ' + (e && e.message || e)); }
+      try { sampler.stop(); } catch (e) { console.error('Остановка: sampler.stop: ' + (e && e.message || e)); }
+      try { hotspot.stop(); } catch (e) { console.error('Остановка: hotspot.stop: ' + (e && e.message || e)); }
+      try { killGpuMonitors(); } catch (e) { console.error('Остановка: killGpuMonitors: ' + (e && e.message || e)); }
+    } finally {
+      clearTimeout(safety);
+      console.log('Остановлено: модель, llama-server.exe, сессии pi (встроенный терминал и боковое окно).');
+      process.exit(0);
     }
-    killSidePowerShell();
-    sampler.stop();
-    hotspot.stop();
-    console.log('Остановлено: модель, llama-server.exe, сессии pi (встроенный терминал и боковое окно).');
-    process.exit(0);
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
