@@ -26,7 +26,7 @@ echo  Спекулятивный драфт: Внешняя модель DFlash 
 echo  Визуальный проектор: mmproj-F16.gguf [ПОДКЛЮЧЕН]
 echo  Оптимизация: Контекст 128K (Максимум для 24GB VRAM), 4-bit KV Cache, FlashAttn
 echo  КЭШ КОНТЕКСТА: Continuous Batching (--cont-batching) [ВКЛЮЧЕН]
-echo  МАКСИМАЛЬНЫЙ РАЗГОН SPEED: Temp 0.1 , Draft N Max 5 [АКТИВИРОВАНО]
+echo  МАКСИМАЛЬНЫЙ РАЗГОН SPEED: Temp 0.2 , Draft N Max 5 [АКТИВИРОВАНО]
 echo  МНОГОПОТОЧНОСТЬ: 1 слот (128K контекст), Continuous Batching для очереди
 echo  Конфигурация: RTX 3090Ti 24GB (Индекс 1) [RTX 4060 НЕ УЧАСТВУЕТ]
 echo  Сетевой адрес: http://192.168.1.117:9931
@@ -44,8 +44,10 @@ echo.
   --fit off ^
   -mg 0 ^
   -c 131072 ^
-  --temp 0.1 ^
+  --temp 0.2 ^
   --top-p 0.95 ^
+  --min-p 0.05 ^
+  --repeat-penalty 1.05 ^
   -t 6 ^
   -tb 6 ^
   --cache-type-k q4_0 ^
@@ -57,8 +59,8 @@ echo.
   -b 2048 ^
   -ub 512 ^
   --jinja ^
-  --reasoning-effort low ^
-  --reasoning-budget 2048 ^
+  --reasoning-effort medium ^
+  --reasoning-budget 8192 ^
   --no-reasoning-preserve ^
   --cors-origins "*" ^
   --parallel 1 ^
