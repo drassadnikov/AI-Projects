@@ -14,7 +14,7 @@
  * Запуск:
  *   node gpu-monitor.js                     # веб-дашборд http://192.168.1.117:8787
  *   node gpu-monitor.js --console           # вывод GPU-метрик в терминал
- *   node gpu-monitor.js --bat "A:\LLM\_Run_Qwen3.8-27B-GSQ-RCO-IQ3_S.bat"
+ *   node gpu-monitor.js --bat "A:\LLM\_Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_S_Ampere.bat"
  *   node gpu-monitor.js --port 9000 --interval 500
  */
 
@@ -52,7 +52,7 @@ const FIELDS = [
 ];
 
 const HISTORY_SIZE = 300; // ~5 минут истории при опросе раз в секунду
-const DEFAULT_BAT = 'A:\\LLM\\_Run_Qwen3.8-27B-GSQ-RCO-IQ3_S.bat';
+const DEFAULT_BAT = 'A:\\LLM\\_Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_S_Ampere.bat';
 const STATE_FILE = path.join(__dirname, 'state.json');
 
 function parseArgs(argv) {
@@ -467,6 +467,7 @@ class LlmManager {
     this.lines = [];
     this._partial = { out: '', err: '' };
     this.genPoints = []; // точки {n, t} по строкам «n_gen = N» для средней скорости
+    this.genSpeedPoints = []; // значения «tg_3s» {v, t} для средней скорости генерации ответа
     this.promptPoints = []; // точки {n, ms, t} по строкам «prompt eval time» для средней скорости промпта
     this._reqStartTs = null; // метка строки «HTTP request» — момент отправки промпта
     this.ctxTokens = null; // текущее использование контекста (n_tokens из «release»-строк)
@@ -476,6 +477,7 @@ class LlmManager {
     // и не очищаются, пока модель не перезапустят (см. start()).
     this.lastPromptTps = null;
     this.lastGenTps = null;
+    this.lastAnswerTps = null;
   }
 
   /** Сменить батник (с проверкой файла). Применяется с следующего запуска. */
@@ -497,6 +499,8 @@ class LlmManager {
       // Средняя скорость генерации по строкам лога «n_gen = N»:
       // (N_конец − N_начало) / Δt в окне последних ~60 с.
       tokensPerSec: this._genTps(),
+      // Скорость генерации ответа: среднее «tg_3s» по строкам лога (окно ~60 с):
+      answerTokensPerSec: this._answerTps(),
       promptTokensPerSec: this._promptTps(),
       ctxTokens: this.ctxTokens,
       ctxLimit: this.ctxLimit,
@@ -523,16 +527,24 @@ class LlmManager {
 
   /** Строка llama-server: «n_gen = N, tg = X t/s, tg_3s = Y t/s» —
    *  N — накопленное число сгенерированных токенов (выводится раз в ~3 с).
+   *  Значения «tg_3s» из тех же строк — в genSpeedPoints (средняя скорость ответа).
    *  Собираем точки {n, t} для средней скорости по строкам лога (окно ~60 с). */
   _parseGen(text) {
-    const m = /n_gen\s*=\s*(\d+),\s*tg\s*=\s*[\d.]+\s*t\/s/.exec(text);
+    const m = /n_gen\s*=\s*(\d+),\s*tg\s*=\s*[\d.]+\s*t\/s(?:,\s*tg_3s\s*=\s*([\d.]+)\s*t\/s)?/.exec(text);
     if (!m) return;
     const n = Number(m[1]);
     const now = Date.now();
     const last = this.genPoints[this.genPoints.length - 1];
-    if (last && n < last.n) this.genPoints.length = 0; // новый запрос — счётчик обнулился
+    if (last && n < last.n) { // новый запрос — счётчик обнулился
+      this.genPoints.length = 0;
+      this.genSpeedPoints.length = 0;
+    }
     this.genPoints.push({ n, t: now });
     while (this.genPoints.length > 1 && now - this.genPoints[0].t > 60000) this.genPoints.shift();
+    if (m[2] != null) {
+      this.genSpeedPoints.push({ v: Number(m[2]), t: now });
+      while (this.genSpeedPoints.length > 1 && now - this.genSpeedPoints[0].t > 60000) this.genSpeedPoints.shift();
+    }
   }
 
   /** Средняя скорость генерации (токенов/с) по окну последних строк «n_gen».
@@ -549,13 +561,60 @@ class LlmManager {
     return this.lastGenTps;
   }
 
+  /** Средняя скорость генерации ответа: арифметическое среднее значений «tg_3s»
+   *  из строк лога в окне последних ~60 с. Кэшируем lastAnswerTps, чтобы после
+   *  завершения запроса значение не очищалось до перезапуска модели. */
+  _answerTps() {
+    const now = Date.now();
+    let sum = 0;
+    let cnt = 0;
+    for (const p of this.genSpeedPoints) {
+      if (now - p.t > 60000) continue;
+      sum += p.v;
+      cnt++;
+    }
+    if (cnt) this.lastAnswerTps = sum / cnt;
+    return this.lastAnswerTps;
+  }
+
 
   /** Контекст: «n_ctx_slot = N» (лимит) и «release: … stop processing: n_tokens = N» (текущее). */
   _parseCtx(text) {
     let m = /n_ctx_slot\s*=\s*(\d+)/.exec(text);
-    if (m) this.ctxLimit = Number(m[1]);
+    if (m) {
+      const limit = Number(m[1]);
+      if (this.ctxLimit !== limit) {
+        this.ctxLimit = limit;
+        this._syncContextWindow(limit);
+      }
+    }
     m = /n_tokens\s*=\s*(\d+),\s*truncated/.exec(text);
     if (m) this.ctxTokens = Number(m[1]);
+  }
+
+  /** Синхронизация pi: contextWindow в models.json ← реальный n_ctx_slot сервера.
+   *  Батник задаёт -c, сервер (llamAmpere) может авто-подогнуть под VRAM —
+   *  поэтому источник истины живой сервер, а не текст батника. */
+  _syncContextWindow(limit) {
+    try {
+      const file = path.join(os.homedir(), '.pi', 'agent', 'models.json');
+      const d = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const models = d && d.providers && d.providers['local-llama'] && d.providers['local-llama'].models;
+      if (!Array.isArray(models)) return;
+      let changed = false;
+      for (const m of models) {
+        if (m && typeof m === 'object' && m.contextWindow !== limit) {
+          m.contextWindow = limit;
+          changed = true;
+        }
+      }
+      if (changed) {
+        fs.writeFileSync(file, JSON.stringify(d, null, 2) + '\n', 'utf8');
+        console.log('models.json: contextWindow = ' + limit + ' (из n_ctx_slot)');
+      }
+    } catch (e) {
+      console.warn('Синхронизация models.json не удалась: ' + e.message);
+    }
   }
 
   /** Строка llama-server — момент начала обработки запроса (отправка промпта).
@@ -643,6 +702,7 @@ class LlmManager {
     this._stopRequested = false;
     this._partial = { out: '', err: '' };
     this.genPoints = [];
+    this.genSpeedPoints = [];
     this.promptPoints = [];
     this._reqStartTs = null;
     this.ctxTokens = null;
@@ -650,6 +710,7 @@ class LlmManager {
     this.lastRequestMs = null;
     this.lastPromptTps = null;
     this.lastGenTps = null;
+    this.lastAnswerTps = null;
     if (this.timer) this.timer.reset();
     if (this.onPersist) this.onPersist(this.batPath);
     this.pushLine('sys', 'Запуск: ' + this.batPath + ' (pid ' + cmd.pid + ')');
@@ -1372,7 +1433,7 @@ const PAGE = `<!doctype html>
         </div>
         <div class="llm-stats">
           <div class="card"><div class="label">Скорость обработки промпта</div><div class="value" id="v-promptps">—</div><div class="unit">tok/s · средняя · prompt eval</div></div>
-          <div class="card"><div class="label">Скорость генерации ответа</div><div class="value" id="v-tokps">—</div><div class="unit">tok/s · средняя · генерация (n_gen)</div></div>
+          <div class="card"><div class="label">Скорость генерации ответа</div><div class="value" id="v-tokps">—</div><div class="unit">tok/s · средняя · генерация (tg_3s)</div></div>
           <div class="card" id="card-reqtime"><div class="label">Время выполнения запроса</div><div class="value" id="v-reqtime">—</div><div class="unit" id="u-reqtime">мин:сек</div></div>
           <div class="card"><div class="label">Контекст</div><div class="value" id="v-ctx">—</div><div class="unit">токенов: занято / лимит</div></div>
         </div>
@@ -1710,7 +1771,8 @@ const PAGE = `<!doctype html>
         document.getElementById('btn-stop').disabled = !d.running;
         setText('bat-current', 'Текущая: ' + d.bat + (d.batExists ? '' : '  (ФАЙЛ НЕ НАЙДЕН)'));
         setText('v-promptps', d.promptTokensPerSec == null ? '—' : Number(d.promptTokensPerSec).toFixed(1));
-        setText('v-tokps', d.tokensPerSec == null ? '—' : Number(d.tokensPerSec).toFixed(1));
+        var tokPs = d.answerTokensPerSec != null ? d.answerTokensPerSec : d.tokensPerSec;
+        setText('v-tokps', tokPs == null ? '—' : Number(tokPs).toFixed(1));
         lastReqTimer = d.reqTimer || null;
         updateReqTimer(lastReqTimer);
         setText('v-ctx', d.ctxTokens == null ? '—' : fmtK(d.ctxTokens) + (d.ctxLimit ? ' / ' + fmtK(d.ctxLimit) : ''));
