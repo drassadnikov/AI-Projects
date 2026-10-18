@@ -48,12 +48,12 @@ gpu-monitor.exe --port 9000   # свой порт (браузер откроет
 | `--host <ip>` | `192.168.1.117` | Адрес, на котором веб-сервер принимает подключения (для доступа с других машин) |
 | `--gpu <idx>` | авто (3090 Ti) | Выбрать GPU по индексу (`nvidia-smi -L`) |
 | `--interval <ms>` | `1000` | Период опроса |
-| `--bat <path>` | `A:\LLM\_Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_S_Ampere.bat` | Батник LLM для запуска/остановки |
+| `--bat <path>` | `A:\LLM\_Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF_Ampere.bat` | Батник LLM для запуска/остановки |
 | `--bats-dir <path>` | каталог батника по умолчанию | Каталог, из которого UI предлагает список `.bat`-файлов |
 | `--console` | — | Режим терминала вместо веб-сервера (без LLM-панели) |
 | `--term-cwd <path>` | `A:\PROJECTS` | Каталог, в котором работает встроенный PowerShell (он сам запускает `pi`) |
 
-## LLM-батник `_Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_S_Ampere.bat`
+## LLM-батник `_Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF_Ampere.bat`
 
 В репозитории лежит эталонный батник, которым поднимается LLM-сервер для панели LLM.
 Бэкенд — **llamAmpere** (форк llama.cpp от JakeATX, заточенный под RTX 3090 / 3090 Ti —

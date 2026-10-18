@@ -14,7 +14,7 @@
  * Запуск:
  *   node gpu-monitor.js                     # веб-дашборд http://192.168.1.117:8787
  *   node gpu-monitor.js --console           # вывод GPU-метрик в терминал
- *   node gpu-monitor.js --bat "A:\LLM\_Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_S_Ampere.bat"
+ *   node gpu-monitor.js --bat "A:\LLM\_Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF_Ampere.bat"
  *   node gpu-monitor.js --port 9000 --interval 500
  */
 
@@ -52,7 +52,7 @@ const FIELDS = [
 ];
 
 const HISTORY_SIZE = 300; // ~5 минут истории при опросе раз в секунду
-const DEFAULT_BAT = 'A:\\LLM\\_Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_S_Ampere.bat';
+const DEFAULT_BAT = 'A:\\LLM\\_Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF_Ampere.bat';
 const STATE_FILE = path.join(__dirname, 'state.json');
 
 function parseArgs(argv) {
