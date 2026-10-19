@@ -103,13 +103,14 @@ Ampere, SM86), Windows-сборка `A:\LLM\llamAmpere\build-win64-cuda\bin\llam
 |------|----------|-----------------|
 | `-m …ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf` | путь | **Основная** модель (27B, ATX-Swift, квант IQ4_XS-M) — модель разработчика llamAmpere с Hugging Face. |
 | `--mmproj …mmproj-F16.gguf` | путь | **Визуальный проектор** (multimodal projector) — подключает зрение к модели Qwen3.8. |
+| `--image-min-tokens 1024` | 1024 | **Минимум image-токенов** для Qwen-VL — убирает предупреждение «Qwen-VL models require at minimum 1024 image tokens» (grounding-задачи). |
 | `--host 192.168.1.117` | IP | Адрес, на котором слушает сервер (доступ с других машин). |
 | `--port 9931` | порт | Порт API (OpenAI-совместимый). |
 | `-c 262144` | 262144 | **Контекст** (context length) = 262K токенов — максимум на одной 24GB-карте (v0.5 RECOMMENDED). |
 | `-ngl 99` | 99 | Выгружает **все слои** модели в VRAM (GPU). |
 | `-fa on` | on | **Flash Attention** — быстрая и экономная по памяти схема внимания. |
-| `-ctk tq5_0` | tq5_0 | Квант **K-компонента** KV-кэша — 5-bit TurboQuant-ключи (вариант «Pure speed» из v0.5 RECOMMENDED — максимальная скорость). |
-| `-ctv turbo4` | turbo4 | Квант **V-компонента** KV-кэша — 4-bit TurboQuant-значения. |
+| `-ctk tq5_0` | tq5_0 | Квант **K-компонента** KV-кэша — 5-bit TurboQuant-ключи (вариант «Pure speed» из v0.5 RECOMMENDED — максимальная скорость декода). Альтернатива: `sjkvarn4` (SJ-KVaRN 4/4, «Balanced»). |
+| `-ctv turbo4` | turbo4 | Квант **V-компонента** KV-кэша — 4-bit TurboQuant-значения. Альтернатива: `sjkvarn4` (SJ-KVaRN 4/4). |
 | `-b 4096` | 4096 | **Batch size** — 4096 токенов за шаг (ускорение prompt processing). |
 | `-ub 1024` | 1024 | **Urgent/minimum batch** — 1024. |
 | `--parallel 1` | 1 | **Параллельные слоты** — 1 (один одновременный запрос, максимум VRAM на контекст). |
@@ -124,7 +125,7 @@ Ampere, SM86), Windows-сборка `A:\LLM\llamAmpere\build-win64-cuda\bin\llam
 > Батник намеренно использует короткие формы `-ctk`/`-ctv`/`-fa` (поддерживаются
 > в сборке llamAmpere), а контекст `-c 262144` подогнан под 24GB VRAM:
 > полный 262K помещается на одной карте (при SJ-KVaRN 4/4 — пик 21,924 MiB;
-> здесь tq5_0/turbo4 — максимальная скорость декода).
+> здесь tq5_0/turbo4 — максимальная скорость декода; альтернатива — sjkvarn4/sjkvarn4 (SJ-KVaRN 4/4)).
 ## Как устроено
 
 - Раз в секунду выполняется `nvidia-smi --query-gpu=... --format=csv` (без админ-прав).
