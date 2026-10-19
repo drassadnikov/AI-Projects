@@ -23,7 +23,7 @@ echo =======================================================================
 echo  Запуск модели: ATX-Swift-1.5-Qwen3.8-27B-Uncensored (IQ4_XS-M)
 echo  Бэкенд: llamAmpere v0.5+ (Сборка под Windows 11, CUDA, sm_86)
 echo  Спекулятивный драфт: Нативная MTP-голова [ВКЛЮЧЕНО ПО УМОЛЧАНИЮ]
-echo  Оптимизация: Контекст 262K (262144) на 1 слот, KV-кэш: tq5_0/turbo4 (макс. скорость)
+echo  Оптимизация: Контекст 262K (262144) на 1 слот, KV-кэш: tq5_0/turbo4 (Pure speed, макс. скорость)
 echo  Дисковый кэш промптов: 24 GiB на A:\LLM\prompt-cache
 echo  Конфигурация: RTX 3090Ti 24GB (CUDA-индекс 0) [RTX 4060 НЕ УЧАСТВУЕТ]
 echo  Сетевой адрес: http://192.168.1.117:9931
@@ -32,11 +32,13 @@ echo.
 
 :: ВАЖНО: Флаг --mmproj подключён — модель Qwen3.8 со зрением (mmproj-F16.gguf).
 :: Максимальная скорость по v0.5 RECOMMENDED (вариант «Pure speed»): KV-кэш tq5_0/turbo4.
+:: Альтернатива: sjkvarn4/sjkvarn4 (SJ-KVaRN 4/4, вариант «Balanced»).
 :: Ускорение префилла: int8 Q*K-внимание (v0.5, по умолчанию выключено)
 set GGML_CUDA_FA_I8QK=1
 "A:\LLM\llamAmpere\build-win64-cuda\bin\llama-server.exe" ^
   -m "A:\LLM\llamAmpere\models\Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF\ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf" ^
   --mmproj "A:\LLM\llamAmpere\models\Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF\mmproj-F16.gguf" ^
+  --image-min-tokens 1024 ^
   --host "192.168.1.117" ^
   --port 9931 ^
   -c 262144 ^
