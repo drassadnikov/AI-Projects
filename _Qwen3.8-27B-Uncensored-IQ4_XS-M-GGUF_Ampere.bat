@@ -1,35 +1,45 @@
 @echo off
-:: REMOVE CRACKLING: cap RTX 3090Ti peak draw at a balanced 250 Watts.
-:: Use the global bus index (1), confirmed by nvidia-smi.
+:: УБИРАЕМ ТРЕСК: Ограничиваем пиковое потребление RTX 3090Ti до сбалансированных 250 Ватт.
+:: Используем глобальный индекс шины (1), подтверждённый nvidia-smi.
 nvidia-smi -i 1 -pl 250
 
-:: AUTO CLOCK: reset locked core clocks - the driver picks the boost itself.
+:: АВТОЧАСТОТА: Сбрасываем фиксацию ядра - драйвер сам подбирает частоту (boost).
 nvidia-smi -i 1 -rgc
 
-:: Force the console codepage back to UTF-8 after the NVIDIA utilities.
+:: Жестко сбрасываем кодировку консоли обратно в UTF-8 после вызова утилит NVIDIA
 chcp 65001 > nul
 cls
 
-:: ISOLATION: hide the RTX 4060 from the AI server, Qwen 3.8 gets only the 3090Ti
-:: (CUDA index 0 = physical GPU 1 in nvidia-smi)
+:: ВАЖНО: тело батника - только 2-байтовая кириллица (UTF-8), без трёхбайтовых
+:: символов (кавычки-ёлочки, длинное тире, многоточие): cmd.exe под chcp 65001
+:: на них десинхронизируется и исполняет хвост строки как команду (в логе было:
+:: 'ива:' is not recognized - хвост комментария "Альтернатива:").
+
+:: ИЗОЛЯЦИЯ: Скрываем RTX 4060 для ИИ-сервера, отдавая Qwen 3.8 только 3090Ti
+:: (CUDA-индекс 0 = физический GPU 1 в nvidia-smi)
 set CUDA_VISIBLE_DEVICES=0
 
 title llamAmpere Server: ATX-Swift-1.5-Qwen3.8-27B-Uncensored (IQ4_XS-M) v0.5
 
-:: Full cleanup of stuck AI processes before start
+:: Полная очистка памяти от всех зависших ИИ-процессов перед стартом
 taskkill /f /im freetoken.exe /im ft.exe /im python.exe /im llama-server.exe /im llama-cli.exe > nul 2>&1
 
-:: NOTE: the .bat body is PURE ASCII on purpose. Under chcp 65001, cmd.exe
-:: desyncs on multi-byte UTF-8 (3-byte chars, e.g. quotes) and can execute a
-:: fragment of a Cyrillic line as a command (log: "'iva:' is not recognized" -
-:: the tail of the comment line "Alternative:"). That is why all comments are
-:: in English and the Russian banner lives in a UTF-8 file printed via PowerShell.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -Encoding UTF8 'A:\LLM\banner_Qwen3.8-27B_Ampere.txt' | Write-Host" 2>nul
+echo =======================================================================
+echo  Запуск модели: ATX-Swift-1.5-Qwen3.8-27B-Uncensored (IQ4_XS-M)
+echo  Бэкенд: llamAmpere v0.5+ (Сборка под Windows 11, CUDA, sm_86)
+echo  Спекулятивный драфт: Нативная MTP-голова [ВКЛЮЧЕНО ПО УМОЛЧАНИЮ]
+echo  Оптимизация: Контекст 110K (110592) на 1 слот, KV-кэш: tq5_0/turbo4 (Pure speed, макс. скорость)
+echo  Reasoning-preserve: ВЫКЛЮЧЕНО (--no-reasoning-preserve - экономит токены в длинных сессиях)
+echo  Дисковый кэш промптов: 24 GiB на A:\LLM\prompt-cache
+echo  Конфигурация: RTX 3090Ti 24GB (CUDA-индекс 0) [RTX 4060 НЕ УЧАСТВУЕТ]
+echo  Сетевой адрес: http://192.168.1.117:9931
+echo =======================================================================
+echo.
 
-:: IMPORTANT: --mmproj is attached - Qwen3.8 vision model (mmproj-F16.gguf).
-:: Max speed per v0.5 RECOMMENDED ("Pure speed"): KV cache tq5_0/turbo4.
-:: Alternative: sjkvarn4/sjkvarn4 (SJ-KVaRN 4/4, "Balanced").
-:: Prefill speedup: int8 Q*K attention (v0.5, off by default)
+:: ВАЖНО: Флаг --mmproj подключён - модель Qwen3.8 со зрением (mmproj-F16.gguf).
+:: Максимальная скорость по v0.5 RECOMMENDED (вариант "Pure speed"): KV-кэш tq5_0/turbo4.
+:: Альтернатива: sjkvarn4/sjkvarn4 (SJ-KVaRN 4/4, вариант "Balanced").
+:: Ускорение префилла: int8 Q*K-внимание (v0.5, по умолчанию выключено)
 set GGML_CUDA_FA_I8QK=1
 "A:\LLM\llamAmpere\build-win64-cuda\bin\llama-server.exe" ^
   -m "A:\LLM\llamAmpere\models\Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF\ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf" ^
@@ -53,7 +63,7 @@ set GGML_CUDA_FA_I8QK=1
 
 echo.
 echo =============================================================
-echo Server stopped or crashed. Check the log above.
+echo Сервер остановился или упал. Проверьте логи выше.
 echo =============================================================
 pause
 exit /b 0
