@@ -136,7 +136,8 @@ Ampere, SM86), Windows-сборка `A:\LLM\llamAmpere\build-win64-cuda\bin\llam
   чтобы финальный `pause` не висел), ловит stdout/stderr в кольцевой буфер (5000 строк).
   Остановка — `taskkill /f /t /pid` (весь процессный поддерево).
 - LLM API: `GET /api/llm`, `GET /api/log?after=<id>`, `POST /api/llm/start`, `POST /api/llm/stop`.
-- Метрики LLM: `LlmManager` парсит лог llama-server — «prompt eval time» (скорость обработки промпта)
+- Метрики LLM: `LlmManager` парсит лог llama-server — «prompt processing … tokens per second» (скорость обработки промпта, среднее по строкам;
+  для старых сборок — «prompt eval time»)
   и «n_gen» (скорость генерации), средние по окну ~60 с; последние вычисленные значения кэшируются
   и не очищаются после завершения запроса (сброс — только перезапуск модели).
 - Время выполнения запроса: `RequestTimer` меряет от отправки промпта до полного idle `pi`.

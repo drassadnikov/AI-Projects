@@ -468,7 +468,7 @@ class LlmManager {
     this._partial = { out: '', err: '' };
     this.genPoints = []; // точки {n, t} по строкам «n_gen = N» для средней скорости
     this.genSpeedPoints = []; // значения «tg_3s» {v, t} для средней скорости генерации ответа
-    this.promptPoints = []; // точки {n, ms, t} по строкам «prompt eval time» для средней скорости промпта
+    this.promptPoints = []; // точки {tps | n, ms, t} по строкам «prompt processing»/«prompt eval time» для средней скорости промпта
     this._reqStartTs = null; // метка строки «HTTP request» — момент отправки промпта
     this.ctxTokens = null; // текущее использование контекста (n_tokens из «release»-строк)
     this.ctxLimit = null;  // лимит контекста (n_ctx_slot)
@@ -640,27 +640,35 @@ class LlmManager {
     this.lastRequestMs = (start != null && ts - start > 0) ? ts - start : Number(m[1]);
   }
 
-  /** Строка llama-server: «prompt eval time = X ms / N tokens» — обработка промпта.
-   *  Собираем точки {n, ms, t} для средней скорости (окно ~60 с). */
+  /** Строка llama-server: «prompt processing, n_tokens = N, progress = P, t = T s / S tokens per second»
+   *  — скорость обработки промпта, печатается по ходу префилла (каждый шаг батча).
+   *  Старые сборки: «prompt eval time = X ms / N tokens» — итоговая строка запроса.
+   *  Собираем точки {tps | n, ms, t} для средней скорости (окно ~60 с). */
   _parsePrompt(text) {
-    const m = /prompt eval time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens/.exec(text);
-    if (!m) return;
     const now = Date.now();
-    this.promptPoints.push({ n: Number(m[2]), ms: Number(m[1]), t: now });
+    let m = /prompt processing,\s*n_tokens\s*=\s*\d+,\s*progress\s*=\s*[\d.]+,\s*t\s*=\s*[\d.]+\s*s\s*\/\s*([\d.]+)\s*tokens per second/.exec(text);
+    if (m) {
+      this.promptPoints.push({ tps: Number(m[1]), t: now });
+    } else {
+      m = /prompt eval time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens/.exec(text);
+      if (!m) return;
+      this.promptPoints.push({ n: Number(m[2]), ms: Number(m[1]), t: now });
+    }
     while (this.promptPoints.length > 1 && now - this.promptPoints[0].t > 60000) this.promptPoints.shift();
   }
 
-  /** Средняя скорость обработки промпта (токенов/с): среднее по строкам
-   *  «prompt eval time» в окне последних ~60 с. Каждая строка даёт свою скорость
-   *  (n / (ms/1000)); берём арифметическое среднее этих значений. Кэшируем
-   *  последнее вычисленное значение (lastPromptTps), чтобы после завершения
-   *  запроса оно не очищалось, пока модель не перезапустят. */
+  /** Средняя скорость обработки промпта (токенов/с): арифметическое среднее
+   *  значений скорости по строкам «prompt processing» (и «prompt eval time»
+   *  для старых сборок) в окне последних ~60 с. Кэшируем последнее
+   *  вычисленное значение (lastPromptTps), чтобы после завершения запроса
+   *  оно не очищалось, пока модель не перезапустят. */
   _promptTps() {
     const now = Date.now();
     const speeds = [];
     for (const p of this.promptPoints) {
       if (now - p.t > 60000) continue;
-      if (p.ms > 0) speeds.push(p.n / (p.ms / 1000));
+      if (p.tps != null) speeds.push(p.tps);
+      else if (p.ms > 0) speeds.push(p.n / (p.ms / 1000));
     }
     if (speeds.length) {
       this.lastPromptTps = speeds.reduce((a, b) => a + b, 0) / speeds.length;
@@ -1432,7 +1440,7 @@ const PAGE = `<!doctype html>
           <button id="btn-log-end" title="Прокрутить к последней строке и следовать за логом">⬇ К концу</button>
         </div>
         <div class="llm-stats">
-          <div class="card"><div class="label">Скорость обработки промпта</div><div class="value" id="v-promptps">—</div><div class="unit">tok/s · средняя · prompt eval</div></div>
+          <div class="card"><div class="label">Скорость обработки промпта</div><div class="value" id="v-promptps">—</div><div class="unit">tok/s · средняя · prompt processing</div></div>
           <div class="card"><div class="label">Скорость генерации ответа</div><div class="value" id="v-tokps">—</div><div class="unit">tok/s · средняя · генерация (tg_3s)</div></div>
           <div class="card" id="card-reqtime"><div class="label">Время выполнения запроса</div><div class="value" id="v-reqtime">—</div><div class="unit" id="u-reqtime">мин:сек</div></div>
           <div class="card"><div class="label">Контекст</div><div class="value" id="v-ctx">—</div><div class="unit">токенов: занято / лимит</div></div>
