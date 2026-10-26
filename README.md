@@ -59,6 +59,19 @@ gpu-monitor.exe --port 9000   # свой порт (браузер откроет
 Бэкенд — **llamAmpere** (форк llama.cpp от JakeATX, заточенный под RTX 3090 / 3090 Ti —
 Ampere, SM86), Windows-сборка `A:\LLM\llamAmpere\build-win64-cuda\bin\llama-server.exe`.
 Запускается через `LlmManager` (кнопка «▶» / автозапуск при открытии дашборда).
+
+Батник работает в **router-режиме**: один `llama-server` обслуживает несколько моделей
+по пресету `A:\LLM\llamAmpere\router-models\pi-models.ini` (копия — `llamAmpere/router-models/pi-models.ini`
+в репозитории). При старте грузятся основные модели, остальные — по требованию
+(в pi команда `/llama`, в Continue — роли embed/rerank).
+
+| Модель | Назначение | Контекст | Загрузка |
+|---|---|---|---|
+| `qwen3.8-27b` | Qwen 3.8 27B Uncensored IQ4_XS-M + зрение (mmproj) | 262K | при старте |
+| `qwen2.5-coder-1.5b` | Qwen2.5 Coder 1.5B Q4_K_M (Tab-автодополнение) | 8K | по требованию (в пресете закомментирована) |
+| `qwen3-embedding-0.6b` | Qwen3 Embedding 0.6B (роль embed в Continue) | 4K | по требованию |
+| `qwen3-reranker-0.6b` | Qwen3 Reranker 0.6B (роль rerank в Continue) | 4K | по требованию |
+
 Ниже — что делает каждая команда и каждый флаг.
 
 ### llamAmpere v0.5 (информация от разработчика)
@@ -90,9 +103,9 @@ Ampere, SM86), Windows-сборка `A:\LLM\llamAmpere\build-win64-cuda\bin\llam
 |------|-----------------|
 | `nvidia-smi -i 1 -pl 300` | Ограничивает **пиковое** потребление RTX 3090 Ti до сбалансированных **300 Вт** (убирает треск от резких пиков). Глобальный индекс шины `1`, подтверждён `nvidia-smi`. Идёт первым — до остальных операций. |
 | `nvidia-smi -i 1 -rgc` | **Сбрасывает фиксацию частоты ядра** (reset GPU clocks) — драйвер сам подбирает частоту (boost). LLM-генерация упирается в пропускную способность VRAM, а не в частоту ядра, поэтому `-lgc` почти не даёт скорости, зато держит лишний нагрев в простое. |
-| `chcp 65001 > nul` | Возвращает кодировку консоли в **UTF-8** (nvidia-smi её сбрасывает). |
+| `chcp 65001 > nul` | Устанавливает кодировку консоли в **UTF-8** (повторно после nvidia-smi, который её сбрасывает). |
 | `cls` | Очистка экрана. |
-| `title llamAmpere Server: …` | Заголовок окна: модель и версия бэкенда. |
+| `title llamAmpere Router: …` | Заголовок окна: режим роутера и список моделей. |
 | `taskkill /f /im freetoken.exe /im ft.exe /im python.exe /im llama-server.exe /im llama-cli.exe` | Полная очистка от **зависших** ИИ-процессов (включая `llama-cli.exe`), чтобы не было дублей и не занятой VRAM. |
 | `set CUDA_VISIBLE_DEVICES=0` | **Изоляция**: для llama-server видна только карта с локальным индексом `0` (RTX 3090 Ti), вторая карта (RTX 4060) от неё скрыта — вся работа уходит на 3090 Ti. CUDA-индекс `0` = физический GPU `1` в `nvidia-smi` (порядок определяет драйвер). |
 | `set GGML_CUDA_FA_I8QK=1` | **Ускорение префилла**: int8 Q*K-внимание в flash-attn (опция llamAmpere v0.5, по умолчанию выключена). |
@@ -101,39 +114,27 @@ Ampere, SM86), Windows-сборка `A:\LLM\llamAmpere\build-win64-cuda\bin\llam
 
 | Флаг | Значение | Ответственность |
 |------|----------|-----------------|
-| `-m …ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf` | путь | **Основная** модель (27B, ATX-Swift, квант IQ4_XS-M) — модель разработчика llamAmpere с Hugging Face. |
-| `--mmproj …mmproj-F16.gguf` | путь | **Визуальный проектор** (multimodal projector) — подключает зрение к модели Qwen3.8. |
-| `--image-min-tokens 1024` | 1024 | **Минимум image-токенов** для Qwen-VL — убирает предупреждение «Qwen-VL models require at minimum 1024 image tokens» (grounding-задачи). |
+| `--models-preset "A:\LLM\llamAmpere\router-models\pi-models.ini"` | путь | **Пресет роутера**: INI-файл с секциями моделей (`[qwen3.8-27b]`, `[qwen2.5-coder-1.5b]`, `[qwen3-embedding-0.6b]`, `[qwen3-reranker-0.6b]`). В каждой секции — `model` (путь к GGUF), `mmproj` (зрение), `ctx-size`, `ngl`, `flash-attn`, `cache-type-k/v` (tq5_0/turbo4 — «Pure speed»), `batch-size`/`ubatch-size`, `parallel`, `image-min-tokens`, `no-reasoning-preserve`, `load-on-startup`. |
+| `--no-models-autoload` | — | Не поднимать ВСЕ модели пресета автоматически: грузятся только секции с `load-on-startup = true` (сейчас — `qwen3.8-27b`), остальные — по требованию (`/llama` в pi, роли embed/rerank в Continue). |
 | `--host 192.168.1.117` | IP | Адрес, на котором слушает сервер (доступ с других машин). |
 | `--port 9931` | порт | Порт API (OpenAI-совместимый). |
-| `-c 110592` | 110592 | **Контекст** (context length) = 110K токенов — рабочий контекст, выбранный под максимальную скорость декода при 300W (полные 262K тоже помещаются на одной 24GB-карте, но 110K быстрее — см. примечание ниже). |
-| `-ngl 99` | 99 | Выгружает **все слои** модели в VRAM (GPU). |
-| `-fa on` | on | **Flash Attention** — быстрая и экономная по памяти схема внимания. |
-| `-ctk tq5_0` | tq5_0 | Квант **K-компонента** KV-кэша — 5-bit TurboQuant-ключи (вариант «Pure speed» из v0.5 RECOMMENDED — максимальная скорость декода). Альтернатива: `sjkvarn4` (SJ-KVaRN 4/4, «Balanced»). |
-| `-ctv turbo4` | turbo4 | Квант **V-компонента** KV-кэша — 4-bit TurboQuant-значения. Альтернатива: `sjkvarn4` (SJ-KVaRN 4/4). |
-| `-b 4096` | 4096 | **Batch size** — 4096 токенов за шаг (ускорение prompt processing). |
-| `-ub 1024` | 1024 | **Urgent/minimum batch** — 1024. |
-| `--parallel 1` | 1 | **Параллельные слоты** — 1 (один одновременный запрос, максимум VRAM на контекст). |
 | `--cors-origins "*"` | * | Разрешить **CORS** со всех источников (доступ из браузера/локальных UI). |
 | `--api-key "local-bypass"` | — | **API-ключ** для запросов (любой ненулевой ключ; `local-bypass` — локальный bypass). |
-| `--no-reasoning-preserve` | — | **Отключает reasoning-preserve**: llamAmpere по умолчанию держит «размышляющие» токены модели (Qwen3.8) в контексте между ходами — отключение экономит контекст в длинных агентных сессиях (и убирает warning «reasoning … enabled by default (may use more tokens)»). |
-| `--cache-disk-path "A:\LLM\prompt-cache"` | путь | **Дисковый prompt-кэш** (llamAmpere v0.5, включён по умолчанию) — куда складывать кэш промптов. |
+| `--cache-disk-path "A:\LLM\prompt-cache"` | путь | **Дисковый prompt-кэш** (llamAmpere v0.5, включён по умолчанию) — общий для всех моделей роутера. |
 | `--cache-disk-limit 24576` | 24576 | Лимит дискового prompt-кэша — 24 GiB (24576 MiB). |
 
 > Примечание: MTP-драфтер и prompt-кэш **включены по умолчанию** в llamAmpere
 > (для Qwen3.8 GGUF с MTP-головой) — флаги `--spec-*` в батнике не нужны.
+> Контекст 262K (262144) для 27B задаётся в пресете (`ctx-size`): полный 262K
+> помещается на одной 24GB-карте (при SJ-KVaRN 4/4 — пик 21,924 MiB); при 300W
+> скорость декода ~50–60 т/с. KV: tq5_0/turbo4 — максимальная скорость декода;
+> альтернатива — sjkvarn4/sjkvarn4 (SJ-KVaRN 4/4, «Balanced»).
 > `^` в конце строк — продолжение одной команды в `cmd.exe`.
 > Тело `.bat` — на русском, но **только 2-байтовая кириллица (UTF-8)**: без
 > трёхбайтовых символов (кавычки-ёлочки «», длинное тире —, многоточие …) —
 > под `chcp 65001` `cmd.exe` на них десинхронизируется и исполняет хвост
 > кириллической строки как команду (в логе было `'ива:' is not recognized...` —
 > хвост комментария "Альтернатива:").
-> Батник намеренно использует короткие формы `-ctk`/`-ctv`/`-fa` (поддерживаются
-> в сборке llamAmpere), а контекст `-c 110592` (110K) выбран под максимальную
-> скорость декода при 300W: полный 262K (262144) тоже помещается на одной 24GB-карте
-> (при SJ-KVaRN 4/4 — пик 21,924 MiB), но при 300W + 262K выходит ~50–60 т/с,
-> а 90–100 т/с требует ≤110K. KV: tq5_0/turbo4 — максимальная скорость декода;
-> альтернатива — sjkvarn4/sjkvarn4 (SJ-KVaRN 4/4, «Balanced»).
 ## Как устроено
 
 - Раз в секунду выполняется `nvidia-smi --query-gpu=... --format=csv` (без админ-прав).
