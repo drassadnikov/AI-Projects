@@ -2,8 +2,9 @@
 /**
  * gpu-monitor.js — онлайн-мониторинг NVIDIA GPU (RTX 3090 Ti) + управление LLM-моделью.
  *
- * Верхняя часть: графики (загрузка, температура, мощность (W), частота (MHz)) и карточки метрик:
- * VRAM, вентилятор, лимит мощности и процессы на GPU (pmon: sm%/mem% на процесс).
+ * Верхняя часть: карточки метрик GPU/CPU (загрузка, память VRAM/DRAM, температуры,
+ * горячие точки, обороты вентиляторов) со спарклайн-графиками под значениями
+ * (по образцу Strata), плюс частота (SM), мощность и процессы на GPU (pmon: sm%/mem% на процесс).
  * Нижняя часть: живой лог LLM-модели (запуск/остановка батника прямо из браузера) и
  * встроенный интерактивный PowerShell (xterm.js + node-pty/ConPTY), который сам запускает
  * команду pi из A:\PROJECTS.
@@ -227,13 +228,23 @@ const LHM_DLL = 'C:\\Program Files\\LibreHardwareMonitor\\LibreHardwareMonitorLi
 const HOTSPOT_PS = `param([string]$DllPath, [int]$IntervalMs)
 $ErrorActionPreference = 'Stop'
 Add-Type -Path $DllPath
+function Get-SensorValue([object[]]$sensors, [string]$type, [string[]]$names) {
+    foreach ($n in $names) {
+        $s = $sensors | Where-Object { $_.SensorType.ToString() -eq $type -and $_.Name -eq $n } | Select-Object -First 1
+        if ($s) { return [math]::Round($s.Value, 1) }
+    }
+    return $null
+}
 $computer = New-Object LibreHardwareMonitor.Hardware.Computer
 $computer.IsGpuEnabled = $true
+$computer.IsCpuEnabled = $true
+$computer.IsMotherboardEnabled = $true
 $computer.Open()
 try {
     while ($true) {
         foreach ($hardware in $computer.Hardware) {
-            if ($hardware.HardwareType -match "Gpu") {
+            $type = $hardware.HardwareType.ToString()
+            if ($type -match "Gpu") {
                 $hardware.Update()
                 $sensors = $hardware.Sensors
                 $core = $sensors | Where-Object {
@@ -245,18 +256,47 @@ try {
                 $memory = $sensors | Where-Object {
                     $_.SensorType -eq "Temperature" -and $_.Name -eq "GPU Memory Junction"
                 } | Select-Object -First 1
+                $fan = $sensors | Where-Object {
+                    $_.SensorType -eq "Fan"
+                } | Select-Object -First 1
                 $coreV = $null
                 if ($core) { $coreV = [math]::Round($core.Value, 1) }
                 $hotspotV = $null
                 if ($hotspot) { $hotspotV = [math]::Round($hotspot.Value, 1) }
                 $memV = $null
                 if ($memory) { $memV = [math]::Round($memory.Value, 1) }
+                $fanV = $null
+                if ($fan -and $fan.Value) { $fanV = [int]$fan.Value }
                 [Console]::WriteLine(([pscustomobject]@{
                     name = $hardware.Name
                     core = $coreV
                     hotspot = $hotspotV
                     memory = $memV
+                    fan = $fanV
                 } | ConvertTo-Json -Compress))
+            } elseif ($type -match "Cpu") {
+                $hardware.Update()
+                $sensors = $hardware.Sensors
+                $loadV = Get-SensorValue $sensors "Load" @('CPU Load', 'CPU Total')
+                $avgV = Get-SensorValue $sensors "Temperature" @('Core (Avg)', 'Core (Tctl/Tdie)', 'CPU Package')
+                $pkgV = Get-SensorValue $sensors "Temperature" @('CPU Package', 'Core (Tctl/Tdie)', 'CCD1 (Tdie)', 'Core (Avg)')
+                [Console]::WriteLine(([pscustomobject]@{
+                    cpu = $hardware.Name
+                    load = $loadV
+                    avg = $avgV
+                    pkg = $pkgV
+                } | ConvertTo-Json -Compress))
+            } elseif ($type -match "Motherboard") {
+                $hardware.Update()
+                $fans = $hardware.Sensors | Where-Object { $_.SensorType -eq "Fan" }
+                foreach ($f in $fans) {
+                    if ($f.Value) {
+                        [Console]::WriteLine(([pscustomobject]@{
+                            fan = $f.Name
+                            rpm = [int]$f.Value
+                        } | ConvertTo-Json -Compress))
+                    }
+                }
             }
         }
         Start-Sleep -Milliseconds $IntervalMs
@@ -275,6 +315,9 @@ class HotspotPoller {
     this.intervalMs = intervalMs;
     this.proc = null;
     this.byName = new Map();
+    this.cpu = null; // {cpu, load, avg, pkg} — данные CPU
+    this.fans = Object.create(null); // имя вентилятора материнской платы -> RPM
+    this.gpuFans = new Map(); // имя GPU -> RPM вентилятора
     this.error = null;
   }
 
@@ -294,15 +337,23 @@ class HotspotPoller {
       this.proc.stdout.on('data', (d) => {
         buf += d.toString('utf8');
         let i;
-        while ((i = buf.indexOf('\n')) !== -1) {
-          const line = buf.slice(0, i).trim();
-          buf = buf.slice(i + 1);
-          if (!line) continue;
-          try {
-            const j = JSON.parse(line);
-            if (j && j.name) this.byName.set(j.name, j);
-          } catch {}
-        }
+          while ((i = buf.indexOf('\n')) !== -1) {
+            const line = buf.slice(0, i).trim();
+            buf = buf.slice(i + 1);
+            if (!line) continue;
+            try {
+              const j = JSON.parse(line);
+              if (!j) continue;
+              if (j.cpu) {
+                this.cpu = j;
+              } else if (j.rpm != null && j.fan) {
+                this.fans[j.fan] = Number(j.rpm);
+              } else if (j.name) {
+                this.byName.set(j.name, j);
+                if (j.fan != null) this.gpuFans.set(j.name, Number(j.fan));
+              }
+            } catch {}
+          }
       });
       this.proc.stderr.on('data', (d) => {
         const msg = d.toString('utf8').trim().split(/\r?\n/)[0];
@@ -337,6 +388,32 @@ class HotspotPoller {
     }
     if (!hit && this.byName.size) hit = this.byName.values().next().value;
     return hit && hit.hotspot != null ? Number(hit.hotspot) : null;
+  }
+  /** Данные CPU (load/avg/pkg) из скрипта LibreHardwareMonitor. */
+  cpu() {
+    return this.cpu;
+  }
+
+  /** Обороты вентилятора CPU (RPM): «CPU Fan», затем «System Fan», иначе первый доступный. */
+  cpuFanRpm() {
+    const names = Object.keys(this.fans);
+    if (!names.length) return null;
+    let pick = names.find((n) => /cpu fan/i.test(n));
+    if (!pick) pick = names.find((n) => /system fan|sys fan/i.test(n));
+    if (!pick) pick = names[0];
+    return this.fans[pick] != null ? Number(this.fans[pick]) : null;
+  }
+
+  /** Обороты вентилятора GPU (RPM) по имени (авто-выбор как в valueFor). */
+  gpuFanRpm(gpuName) {
+    let hit = this.gpuFans.get(gpuName);
+    if (hit == null) {
+      for (const [name, v] of this.gpuFans) {
+        if (/3090\s*ti/i.test(name)) { hit = v; break; }
+      }
+    }
+    if (hit == null && this.gpuFans.size) hit = this.gpuFans.values().next().value;
+    return hit != null ? Number(hit) : null;
   }
 
   stop() {
@@ -979,9 +1056,14 @@ function fmt(v, d) {
 
 function consoleLine(s) {
   const ts = new Date(s.t).toLocaleTimeString('ru-RU');
+  const GB = 1024 * 1024 * 1024;
   const mem =
     s.memUsed != null && s.memTotal
       ? (s.memUsed / 1024).toFixed(1) + '/' + (s.memTotal / 1024).toFixed(1) + ' GB'
+      : '--';
+  const dram =
+    s.dramUsed != null && s.dramTotal
+      ? (s.dramUsed / GB).toFixed(1) + '/' + (s.dramTotal / GB).toFixed(1) + ' GB'
       : '--';
   const procs = s.processes && s.processes.length
     ? ' | процессы: ' + s.processes.map((p) => p.command + ' mem=' + fmt(p.mem) + '%').join(', ')
@@ -994,7 +1076,11 @@ function consoleLine(s) {
     ' | ' + fmt(s.power, 1) + ' W' +
     ' | ' + fmt(s.clock) + ' MHz' +
     ' | VRAM ' + mem +
+    ' | DRAM ' + dram +
     ' | вентилятор ' + fmt(s.fan) + '%' +
+    ' | CPU ' + fmt(s.cpuLoad) + '%' +
+    ' | CPU ' + fmt(s.cpuTemp) + '°C' +
+    ' | fan CPU ' + fmt(s.cpuFan) + ' RPM' +
     procs
   );
 }
@@ -1298,7 +1384,8 @@ const PAGE = `<!doctype html>
   h1 { font-size: 20px; margin: 0; font-weight: 600; }
   h1 #gname { color: #4fc3f7; }
   .sub { color: #8b949e; font-size: 13px; margin-left: auto; }
-  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+  .cards2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  .cards3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 12px; }
   .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 12px 14px; }
   .card .label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; }
   .card .value { font-size: 30px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
@@ -1306,14 +1393,10 @@ const PAGE = `<!doctype html>
   .bar { height: 6px; background: #21262d; border-radius: 3px; margin-top: 8px; overflow: hidden; }
   .bar-fill { height: 100%; width: 0%; background: #4fc3f7; border-radius: 3px; transition: width .5s; }
   .note { font-size: 11px; color: #6e7681; margin-top: 6px; }
-  .charts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 12px; }
   .panel { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
   .panel .title { font-size: 12px; color: #8b949e; margin-bottom: 6px; }
-  canvas { width: 100%; height: 130px; display: block; }
-  .foot { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
-  .foot .card { margin-bottom: 0; }
+  .spark { width: 100%; height: 40px; display: block; margin-top: 8px; }
   .llm-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
-  .foot .card .value { font-size: 22px; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #21262d; color: #c9d1d9; font-variant-numeric: tabular-nums; }
   th { color: #8b949e; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
@@ -1334,7 +1417,7 @@ const PAGE = `<!doctype html>
   .log-col .llm-stats .card .value { font-size: 24px; }
   .log-col .llm-stats .card.live { border-color: #1f6feb; box-shadow: 0 0 0 1px rgba(31,111,235,.35); }
   .log-col .llm-stats .card.live .value { color: #58a6ff; }
-.log { background: #010409; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; height: 420px; overflow-y: auto; font-family: 'Cascadia Mono', Consolas, monospace; font-size: 16px; line-height: 1.19; }
+.log { background: #010409; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; height: 640px; overflow-y: auto; font-family: 'Cascadia Mono', Consolas, monospace; font-size: 16px; line-height: 1.19; }
   .log .l-out { color: #c9d1d9; white-space: pre-wrap; word-break: break-word; }
   .log .l-err { color: #7ec8f7; white-space: pre-wrap; word-break: break-word; }
   .log .l-sys { color: #7ee787; white-space: pre-wrap; word-break: break-word; }
@@ -1359,16 +1442,16 @@ const PAGE = `<!doctype html>
   .panel-llm { max-width: none; }
   .llm-cols { display: flex; flex-wrap: wrap; gap: 12px; align-items: stretch; }
   .log-col { flex: 1 1 0; min-width: 340px; }
-  .term-col { flex: 1 1 0; min-width: 340px; display: flex; flex-direction: column; min-height: 448px; }
+  .term-col { flex: 1 1 0; min-width: 340px; display: flex; flex-direction: column; min-height: 668px; }
   .term-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
   .term-status { font-size: 13px; color: #c9d1d9; }
-  .term-wrap { position: relative; flex: 1; min-height: 408px; display: flex; }
+  .term-wrap { position: relative; flex: 1; min-height: 628px; display: flex; }
   .term-box { flex: 1; background: #010409; border: 1px solid #21262d; border-radius: 8px; padding: 4px 6px; }
   .term-box .xterm { height: 100%; }
   .log-wrap { position: relative; }
   #btn-log-end, #btn-term-end { position: absolute; right: 10px; bottom: 10px; display: none; background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 8px; padding: 4px 10px; font-size: 12px; cursor: pointer; z-index: 2; }
   #btn-log-end:hover, #btn-term-end:hover { background: #30363d; }
-  @media (max-width: 720px) { .cards, .charts, .foot { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 720px) { .cards2, .cards3 { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
@@ -1380,33 +1463,20 @@ const PAGE = `<!doctype html>
   </header>
   <div class="errbox" id="errbox"></div>
 
-  <div class="charts">
-    <div class="panel"><div class="title">Загрузка, % — последние 2 минуты</div><canvas id="c-util"></canvas></div>
-    <div class="panel"><div class="title">Температура (ядро и горячая точка), °C — последние 2 минуты</div><canvas id="c-temp"></canvas></div>
-    <div class="panel"><div class="title">Мощность, W — последние 2 минуты</div><canvas id="c-power"></canvas></div>
-    <div class="panel"><div class="title">Частота, MHz — последние 2 минуты</div><canvas id="c-clock"></canvas></div>
-  </div>
-
-  <div class="cards">
-    <div class="card"><div class="label">Загрузка GPU</div><div class="value" id="v-util">—</div><div class="unit">%</div></div>
-    <div class="card"><div class="label">Температура</div><div class="value" id="v-temp">—</div><div class="unit">°C</div></div>
-    <div class="card"><div class="label">Температура горячей точки</div><div class="value" id="v-hotspot">—</div><div class="unit">°C</div></div>
-    <div class="card"><div class="label">Частота (SM)</div><div class="value" id="v-clock">—</div><div class="unit">MHz</div></div>
-  </div>
-
-  <div class="foot">
-    <div class="card">
-      <div class="label">Выделенная память GPU</div>
-      <div class="value" id="v-mem">—</div><div class="unit">GB</div>
-      <div class="bar"><div class="bar-fill" id="mem-bar"></div></div>
-    </div>
-    <div class="card">
-      <div class="label">Вентилятор</div>
-      <div class="value" id="v-fan">—</div><div class="unit">%</div>
-      <div class="note">NVML отдаёт долю от максимума; RPM для этой карты не доступен</div>
-    </div>
-    <div class="card"><div class="label">Мощность</div><div class="value" id="v-power">—</div><div class="unit">W</div></div>
-    <div class="card"><div class="label">Лимит мощности</div><div class="value" id="v-limit">—</div><div class="unit">W</div></div>
+  <div class="cards2">
+    <div class="card"><div class="label">Загрузка GPU</div><div class="value" id="v-util">—</div><div class="unit">%</div><canvas class="spark" id="s-util"></canvas></div>
+    <div class="card"><div class="label">Загрузка CPU</div><div class="value" id="v-cpuload">—</div><div class="unit">%</div><canvas class="spark" id="s-cpuload"></canvas></div>
+    <div class="card"><div class="label">Выделенная память VRAM</div><div class="value" id="v-mem">—</div><div class="unit">GB</div><canvas class="spark" id="s-mem"></canvas></div>
+    <div class="card"><div class="label">Выделенная память DRAM</div><div class="value" id="v-dram">—</div><div class="unit">GB</div><canvas class="spark" id="s-dram"></canvas></div>
+    <div class="card"><div class="label">Температура GPU</div><div class="value" id="v-temp">—</div><div class="unit">°C</div><canvas class="spark" id="s-temp"></canvas></div>
+    <div class="card"><div class="label">Температура CPU</div><div class="value" id="v-cputemp">—</div><div class="unit">°C</div><canvas class="spark" id="s-cputemp"></canvas></div>
+    <div class="card"><div class="label">Температура горячей точки GPU</div><div class="value" id="v-hotspot">—</div><div class="unit">°C</div><canvas class="spark" id="s-hotspot"></canvas></div>
+    <div class="card"><div class="label">Температура горячей точки CPU</div><div class="value" id="v-cpuhotspot">—</div><div class="unit">°C</div><canvas class="spark" id="s-cpuhotspot"></canvas></div>
+    <div class="card"><div class="label">Обороты вентилятора GPU</div><div class="value" id="v-gpufan">—</div><div class="unit" id="u-gpufan">RPM</div><canvas class="spark" id="s-gpufan"></canvas></div>
+    <div class="card"><div class="label">Обороты вентилятора CPU</div><div class="value" id="v-cpufan">—</div><div class="unit" id="u-cpufan">RPM</div><canvas class="spark" id="s-cpufan"></canvas></div>
+    <div class="card"><div class="label">Частота (SM)</div><div class="value" id="v-clock">—</div><div class="unit">MHz</div><canvas class="spark" id="s-clock"></canvas></div>
+    <div class="card"><div class="label">Мощность</div><div class="value" id="v-power">—</div><div class="unit">W</div><canvas class="spark" id="s-power"></canvas></div>
+    <div class="card"><div class="label">Лимит мощности</div><div class="value" id="v-limit">—</div><div class="unit">W</div><canvas class="spark" id="s-limit"></canvas></div>
   </div>
 
   <div class="panel">
@@ -1471,11 +1541,20 @@ const PAGE = `<!doctype html>
 (function () {
   'use strict';
   var WINDOW_MS = 120000;
-  var CHARTS = [
-    { key: 'util',  cv: 'c-util',  color: '#4fc3f7', min: 0,   max: 100 },
-    { key: 'temp',  cv: 'c-temp',  color: '#ff7043', min: 20,  max: 90, extra: { key: 'hotspot', color: '#ff5252' } },
-    { key: 'power', cv: 'c-power', color: '#ffd54f', min: 0,   max: 500 },
-    { key: 'clock', cv: 'c-clock', color: '#81c784', min: 400, max: 2300 }
+  var SPARKS = [
+    { key: 'util',       cv: 's-util',       color: '#4fc3f7', min: 0, max: 100 },
+    { key: 'cpuLoad',    cv: 's-cpuload',    color: '#81c784', min: 0, max: 100 },
+    { key: 'util',       cv: 's-mem',        color: '#4fc3f7', min: 0, max: 100, val: function (s) { return s.memUsed != null && s.memTotal ? s.memUsed / s.memTotal * 100 : null; } },
+    { key: 'util',       cv: 's-dram',       color: '#4fc3f7', min: 0, max: 100, val: function (s) { return s.dramUsed != null && s.dramTotal ? s.dramUsed / s.dramTotal * 100 : null; } },
+    { key: 'temp',       cv: 's-temp',       color: '#ff7043', min: 0, max: 100 },
+    { key: 'cpuTemp',    cv: 's-cputemp',    color: '#ff7043', min: 0, max: 100 },
+    { key: 'hotspot',    cv: 's-hotspot',    color: '#ff5252', min: 0, max: 100 },
+    { key: 'cpuHotspot', cv: 's-cpuhotspot', color: '#ff5252', min: 0, max: 100 },
+    { key: 'gpuFan',     cv: 's-gpufan',     color: '#4fc3f7', min: 0, max: 2500 },
+    { key: 'cpuFan',     cv: 's-cpufan',     color: '#4fc3f7', min: 0, max: 2500 },
+    { key: 'clock',      cv: 's-clock',      color: '#81c784', min: 0, max: 2500 },
+    { key: 'power',      cv: 's-power',      color: '#ffd54f', min: 0, max: 500 },
+    { key: 'powerLimit', cv: 's-limit',      color: '#8b949e', min: 0, max: 500 }
   ];
 
   function fmt(v, d) { return v == null ? '—' : Number(v).toFixed(d == null ? 0 : d); }
@@ -1494,72 +1573,44 @@ const PAGE = `<!doctype html>
     return { ctx: ctx, w: w, h: h };
   }
 
-  function drawChart(cv, hist, cfg, now) {
+  function drawSpark(cv, hist, cfg, now) {
     var s = sizeCanvas(cv);
     var ctx = s.ctx, W = s.w, H = s.h;
     ctx.clearRect(0, 0, W, H);
     var t0 = now - WINDOW_MS, t1 = now;
     var lo = cfg.min, hi = cfg.max;
     var px = function (t) { return (t - t0) / (t1 - t0) * W; };
-    var py = function (v) { return H - 4 - (v - lo) / (hi - lo) * (H - 8); };
-
-    ctx.strokeStyle = '#21262d';
-    ctx.fillStyle = '#8b949e';
-    ctx.font = '10px Segoe UI, sans-serif';
-    ctx.lineWidth = 1;
-    for (var g = 0; g <= 4; g++) {
-      var yv = lo + (hi - lo) * g / 4;
-      var y = py(yv);
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-      ctx.fillText(String(Math.round(yv)), 3, Math.max(10, y - 3));
-    }
+    var py = function (v) { return H - 2 - (v - lo) / (hi - lo) * (H - 4); };
 
     var pts = [];
     for (var i = 0; i < hist.length; i++) {
       var smp = hist[i];
       if (smp.t < t0) continue;
-      var val = smp[cfg.key];
+      var val = cfg.val ? cfg.val(smp) : smp[cfg.key];
       if (val == null) {
-        if (pts.length) { stroke(pts, ctx, cfg.color, true); pts = []; }
+        if (pts.length) { strokeSpark(pts, ctx, cfg.color); pts = []; }
         continue;
       }
       pts.push([px(smp.t), py(val)]);
     }
-    if (pts.length) stroke(pts, ctx, cfg.color, true);
-    if (cfg.extra) {
-      var pts2 = [];
-      for (var i2 = 0; i2 < hist.length; i2++) {
-        var smp2 = hist[i2];
-        if (smp2.t < t0) continue;
-        var v2 = smp2[cfg.extra.key];
-        if (v2 == null) {
-          if (pts2.length) stroke(pts2, ctx, cfg.extra.color, false);
-          pts2 = [];
-          continue;
-        }
-        pts2.push([px(smp2.t), py(v2)]);
-      }
-      if (pts2.length) stroke(pts2, ctx, cfg.extra.color, false);
-    }
+    if (pts.length) strokeSpark(pts, ctx, cfg.color);
 
-    function stroke(pts, ctx, color, fillArea) {
+    function strokeSpark(pts, ctx, color) {
       ctx.strokeStyle = color;
-      ctx.lineWidth = fillArea ? 2 : 1.5;
+      ctx.lineWidth = 1.5;
       ctx.beginPath();
       for (var k = 0; k < pts.length; k++) {
         if (k) ctx.lineTo(pts[k][0], pts[k][1]);
         else ctx.moveTo(pts[k][0], pts[k][1]);
       }
       ctx.stroke();
-      if (fillArea) {
-        ctx.lineTo(pts[pts.length - 1][0], H);
-        ctx.lineTo(pts[0][0], H);
-        ctx.closePath();
-        ctx.globalAlpha = 0.12;
-        ctx.fillStyle = color;
-        ctx.fill();
-        ctx.globalAlpha = 1;
-      }
+      ctx.lineTo(pts[pts.length - 1][0], H);
+      ctx.lineTo(pts[0][0], H);
+      ctx.closePath();
+      ctx.globalAlpha = 0.15;
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -1607,24 +1658,43 @@ const PAGE = `<!doctype html>
         setText('gname', L.name);
         document.title = 'GPU Monitor — ' + L.name;
         setText('v-util', fmt(L.util));
+        setText('v-cpuload', fmt(L.cpuLoad));
         setText('v-temp', fmt(L.temp));
+        setText('v-cputemp', fmt(L.cpuTemp));
         setText('v-hotspot', fmt(L.hotspot, 1));
+        setText('v-cpuhotspot', fmt(L.cpuHotspot, 1));
         setText('v-power', fmt(L.power, 1));
         setText('v-clock', fmt(L.clock));
         if (L.memUsed != null && L.memTotal) {
           setText('v-mem', (L.memUsed / 1024).toFixed(1) + ' / ' + (L.memTotal / 1024).toFixed(1));
-          var pct = Math.min(100, Math.round(L.memUsed / L.memTotal * 100));
-          var bar = document.getElementById('mem-bar');
-          bar.style.width = pct + '%';
-          bar.style.background = pct >= 90 ? '#ef4444' : (pct >= 70 ? '#ffd54f' : '#4fc3f7');
         }
-        setText('v-fan', fmt(L.fan));
+        if (L.dramUsed != null && L.dramTotal) {
+          setText('v-dram', (L.dramUsed / 1073741824).toFixed(1) + ' / ' + (L.dramTotal / 1073741824).toFixed(1));
+        }
+        // Вентиляторы: RPM из LibreHardwareMonitor; если нет — доля % от NVML (GPU).
+        if (L.gpuFan != null) {
+          setText('v-gpufan', fmt(L.gpuFan));
+          setText('u-gpufan', 'RPM');
+        } else if (L.fan != null) {
+          setText('v-gpufan', fmt(L.fan));
+          setText('u-gpufan', '% (NVML)');
+        } else {
+          setText('v-gpufan', '—');
+          setText('u-gpufan', 'RPM');
+        }
+        if (L.cpuFan != null) {
+          setText('v-cpufan', fmt(L.cpuFan));
+          setText('u-cpufan', 'RPM');
+        } else {
+          setText('v-cpufan', '—');
+          setText('u-cpufan', 'RPM');
+        }
         setText('v-limit', fmt(L.powerLimit));
         setText('updated', 'обновлено ' + new Date(L.t).toLocaleTimeString('ru-RU'));
         renderProcs(L.processes);
         var now = Date.now();
-        for (var i = 0; i < CHARTS.length; i++) {
-          drawChart(document.getElementById(CHARTS[i].cv), d.history, CHARTS[i], now);
+        for (var i = 0; i < SPARKS.length; i++) {
+          drawSpark(document.getElementById(SPARKS[i].cv), d.history, SPARKS[i], now);
         }
       })
       .catch(function (e) {
@@ -2585,7 +2655,18 @@ function main() {
     smiPath: smi,
     intervalMs: opts.intervalMs,
     gpuIndex: opts.gpu,
-    augment: (s) => { s.hotspot = hotspot.valueFor(s.name); },
+    augment: (s) => {
+      s.hotspot = hotspot.valueFor(s.name);
+      const c = hotspot.cpu();
+      s.cpuLoad = c && c.load != null ? Number(c.load) : null;
+      s.cpuTemp = c && c.avg != null ? Number(c.avg) : null;
+      s.cpuHotspot = c && c.pkg != null ? Number(c.pkg) : s.cpuTemp;
+      s.cpuFan = hotspot.cpuFanRpm();
+      s.gpuFan = hotspot.gpuFanRpm(s.name);
+      const total = os.totalmem();
+      s.dramTotal = total;
+      s.dramUsed = total - os.freemem();
+    },
     onSample: (s, samp) => {
       if (!noted) {
         noted = true;
