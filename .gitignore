@@ -3,7 +3,11 @@ log/
 .tmp-test/
 *.tmp-test*
 nul
+nul-
 state.json
+restart-check.json
+tm-shot.png
+tmp-*
 *.exe
 sea.bin
 *.log

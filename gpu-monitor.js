@@ -44,8 +44,10 @@ const FIELDS = [
   'name',
   'utilization.gpu',
   'temperature.gpu',
+  'temperature.memory',
   'power.draw',
   'clocks.sm',
+  'clocks.mem',
   'fan.speed',
   'power.limit',
   'memory.used',
@@ -201,8 +203,10 @@ class Sampler {
       name: g.name,
       util: g['utilization.gpu'],
       temp: g['temperature.gpu'],
+      memTemp: g['temperature.memory'],
       power: g['power.draw'],
       clock: g['clocks.sm'],
+      memClock: g['clocks.mem'],
       fan: g['fan.speed'],
       powerLimit: g['power.limit'],
       memUsed: g['memory.used'],
@@ -210,8 +214,8 @@ class Sampler {
       processes,
     };
     this.error = null;
-    if (this.augment) this.augment(this.latest);
     this.history.push(this.latest);
+    if (this.augment) this.augment(this.latest, this);
     if (this.history.length > HISTORY_SIZE) this.history.shift();
     if (this.onSample) this.onSample(this.latest, this);
   }
@@ -239,7 +243,75 @@ $computer = New-Object LibreHardwareMonitor.Hardware.Computer
 $computer.IsGpuEnabled = $true
 $computer.IsCpuEnabled = $true
 $computer.IsMotherboardEnabled = $true
+$computer.IsMemoryEnabled = $true
 $computer.Open()
+# --- Частота CPU как «Скорость» в диспетчере задач: среднее по ядрам (WMI CurrentClockSpeed); P-state (MSR 0xC0010293) — запасной ---
+$script:amdMod = $null
+$script:mReadMsr = $null
+try {
+    $asmLhm = [System.Reflection.Assembly]::LoadFrom($DllPath)
+    $tAmd = $asmLhm.GetType('LibreHardwareMonitor.PawnIo.AmdFamily17')
+    if ($tAmd) {
+        $script:amdMod = [Activator]::CreateInstance($tAmd)
+        $script:mReadMsr = $tAmd.GetMethods() | Where-Object { $_.Name -eq 'ReadMsr' -and $_.GetParameters().Count -eq 3 } | Select-Object -First 1
+    }
+} catch {}
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class GpuMonWin {
+  [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentThread();
+  [DllImport("kernel32.dll")] public static extern bool SetThreadAffinityMask(IntPtr h, UIntPtr mask);
+}
+'@
+function Read-MsrEax {
+    param([long]$Idx)
+    if (-not $script:amdMod -or -not $script:mReadMsr) { return $null }
+    $u = [uint32]([long]$Idx -band 0xFFFFFFFFL)
+    $objs = [object[]]@($u, [uint32]0, [uint32]0)
+    try { $null = $script:mReadMsr.Invoke($script:amdMod, $objs) } catch { return $null }
+    return $objs[1]
+}
+function Get-CpuPstate([object[]]$sensors) {
+    if (-not $script:mReadMsr) { return $null }
+    $busV = Get-SensorValue $sensors "Clock" @('Bus Speed')
+    if (-not $busV) { return $null }
+    $bus = [double]$busV
+    $n = [Environment]::ProcessorCount
+    $fullMask = ([uint64]1 -shl ([Math]::Min($n, 63) - 1)) - 1
+    $ht = [GpuMonWin]::GetCurrentThread()
+    $max = 0.0
+    try {
+        for ($i = 0; $i -lt $n; $i++) {
+            $mask = [Activator]::CreateInstance([UIntPtr], @([uint64]([uint64]1 -shl $i)))
+            [void][GpuMonWin]::SetThreadAffinityMask($ht, $mask)
+            Start-Sleep -Milliseconds 5
+            $eaxV = Read-MsrEax 0xC0010293
+            if ($null -eq $eaxV) { continue }
+            $fid = $eaxV -band 0xFF
+            $dfsid = ($eaxV -shr 8) -band 0x3F
+            if ($dfsid -eq 0) { continue }
+            $f = ($fid / $dfsid) * $bus * 2
+            if ($f -gt $max) { $max = $f }
+        }
+    } finally {
+        [void][GpuMonWin]::SetThreadAffinityMask($ht, [Activator]::CreateInstance([UIntPtr], @([uint64]$fullMask)))
+    }
+    if ($max -le 0) { return $null }
+    return [math]::Round($max)
+}
+# Частота CPU как «Скорость» в диспетчере задач Windows 11: PDH-счётчик
+# «Сведения о процессоре(_Total)\\Фактическая частота» (локализованное имя, typeperf)
+function Get-CpuFreqTypeperf {
+    try {
+        $lines = & typeperf '\\Сведения о процессоре(_Total)\\Фактическая частота' -sc 1 2>$null
+        foreach ($l in $lines) {
+            $m = [regex]::Match([string]$l, '^"?[^",]+"?,?"([0-9]+(?:\\.[0-9]+)?)"$')
+            if ($m.Success) { return [math]::Round([double]$m.Groups[1].Value) }
+        }
+    } catch {}
+    return $null
+}
 try {
     while ($true) {
         foreach ($hardware in $computer.Hardware) {
@@ -256,9 +328,7 @@ try {
                 $memory = $sensors | Where-Object {
                     $_.SensorType -eq "Temperature" -and $_.Name -eq "GPU Memory Junction"
                 } | Select-Object -First 1
-                $fan = $sensors | Where-Object {
-                    $_.SensorType -eq "Fan"
-                } | Select-Object -First 1
+                $fanSensors = @($sensors | Where-Object { $_.SensorType -eq "Fan" -and $null -ne $_.Value })
                 $coreV = $null
                 if ($core) { $coreV = [math]::Round($core.Value, 1) }
                 $hotspotV = $null
@@ -266,7 +336,9 @@ try {
                 $memV = $null
                 if ($memory) { $memV = [math]::Round($memory.Value, 1) }
                 $fanV = $null
-                if ($fan -and $fan.Value) { $fanV = [int]$fan.Value }
+                if ($fanSensors.Count -gt 0) {
+                    $fanV = [int][math]::Round(($fanSensors | Measure-Object -Property Value -Average).Average)
+                }
                 [Console]::WriteLine(([pscustomobject]@{
                     name = $hardware.Name
                     core = $coreV
@@ -278,24 +350,79 @@ try {
                 $hardware.Update()
                 $sensors = $hardware.Sensors
                 $loadV = Get-SensorValue $sensors "Load" @('CPU Load', 'CPU Total')
-                $avgV = Get-SensorValue $sensors "Temperature" @('Core (Avg)', 'Core (Tctl/Tdie)', 'CPU Package')
-                $pkgV = Get-SensorValue $sensors "Temperature" @('CPU Package', 'Core (Tctl/Tdie)', 'CCD1 (Tdie)', 'Core (Avg)')
+                # AIDA64: «ЦП» = Tdie (CCD1 (Tdie)), «ЦП диод» = Tctl/Tdie
+                # AIDA64: «ЦП» = Tdie (самое горячее ядро/CCD), «ЦП диод» = Tctl/Tdie
+                # «Температура CPU» = Tdie; «диод CPU» = Tctl/Tdie (как «ЦП диод»/«Весь ЦП» у AIDA64)
+                $tdieV = Get-SensorValue $sensors "Temperature" @('Core (Max)', 'CCD1 (Tdie)', 'CCD2 (Tdie)')
+                $tctlV = Get-SensorValue $sensors "Temperature" @('Core (Tctl/Tdie)', 'CPU Package')
+                $pwrV = Get-SensorValue $sensors "Power" @('Package', 'CPU Package')
+                $clkV = Get-SensorValue $sensors "Clock" @('Cores (Average)', 'Core (Avg)', 'CPU Clock')
+                $busV = Get-SensorValue $sensors "Clock" @('Bus Speed')
+                # Частота как «Скорость» в диспетчере задач: максимальный P-state по ядрам (MSR 0xC0010293)
+                # Запасная частота: максимальный P-state по ядрам (MSR 0xC0010293)
+                $pstateV = Get-CpuPstate $sensors
+                # Частота как «Скорость» в диспетчере задач Windows 11: среднее по логическим процессорам (WMI)
+                $curClkV = $null
+                try {
+                    $ci = @(Get-CimInstance Win32_Processor -ErrorAction Stop)
+                    if ($ci.Count -gt 0) { $curClkV = [int]$ci[0].CurrentClockSpeed }
+                } catch {}
+                # Частота как «Скорость» в диспетчере задач: PDH «Фактическая частота» (typeperf)
+                $pdhV = Get-CpuFreqTypeperf
                 [Console]::WriteLine(([pscustomobject]@{
                     cpu = $hardware.Name
                     load = $loadV
-                    avg = $avgV
-                    pkg = $pkgV
+                    tdie = $tdieV
+                    tctl = $tctlV
+                    power = $pwrV
+                    clock = $clkV
+                    bclk = $busV
+                    pstate = $pstateV
+                    curclk = $curClkV
+                    pdhfreq = $pdhV
                 } | ConvertTo-Json -Compress))
             } elseif ($type -match "Motherboard") {
                 $hardware.Update()
-                $fans = $hardware.Sensors | Where-Object { $_.SensorType -eq "Fan" }
+                $all = @($hardware.Sensors)
+                foreach ($sub in $hardware.SubHardware) {
+                    $sub.Update()
+                    $all += @($sub.Sensors)
+                }
+                $fans = @($all | Where-Object { $_.SensorType -eq "Fan" })
+                $ctrls = @($all | Where-Object { $_.SensorType -eq "Control" })
                 foreach ($f in $fans) {
                     if ($f.Value) {
+                        $ctrlV = $null
+                        $c = $ctrls | Where-Object { $_.Name -eq $f.Name -and $null -ne $_.Value } | Select-Object -First 1
+                        if ($c) { $ctrlV = [math]::Round($c.Value, 1) }
                         [Console]::WriteLine(([pscustomobject]@{
                             fan = $f.Name
                             rpm = [int]$f.Value
+                            ctrl = $ctrlV
                         } | ConvertTo-Json -Compress))
                     }
+                }
+                # Датчики материнской платы (NCT6799D) — те же значения, что показывает Armoury Crate
+                $vrmV = Get-SensorValue $all "Temperature" @('VRM')
+                $mbtV = Get-SensorValue $all "Temperature" @('Motherboard')
+                $v12V = Get-SensorValue $all "Voltage" @('+12V')
+                $v5V = Get-SensorValue $all "Voltage" @('+5V')
+                $vcoV = Get-SensorValue $all "Voltage" @('Vcore')
+                [Console]::WriteLine(([pscustomobject]@{
+                    mb = $hardware.Name
+                    vrm = $vrmV
+                    mbtemp = $mbtV
+                    volt12 = $v12V
+                    volt5 = $v5V
+                    vcore = $vcoV
+                } | ConvertTo-Json -Compress))
+            } elseif ($type -match "Memory") {
+                $hardware.Update()
+                $sensors = $hardware.Sensors
+                $dimms = @($sensors | Where-Object { $_.SensorType -eq "Temperature" -and $_.Name -match '^DIMM' -and $null -ne $_.Value })
+                if ($dimms.Count -gt 0) {
+                    $dramV = [math]::Round(($dimms | Measure-Object -Property Value -Maximum).Maximum, 1)
+                    [Console]::WriteLine(([pscustomobject]@{ dram = $dramV } | ConvertTo-Json -Compress))
                 }
             }
         }
@@ -315,8 +442,11 @@ class HotspotPoller {
     this.intervalMs = intervalMs;
     this.proc = null;
     this.byName = new Map();
-    this.cpu = null; // {cpu, load, avg, pkg} — данные CPU
+    this.cpuData = null; // {cpu, load, avg, pkg} — данные CPU
     this.fans = Object.create(null); // имя вентилятора материнской платы -> RPM
+    this.fanCtrl = Object.create(null); // имя вентилятора -> % управления (Control-сенсор LHM)
+    this.mbData = null; // {mb, vrm, mbtemp, volt12, volt5, vcore} — датчики материнской платы (NCT6799D)
+    this.dramTemp = null; // температура DRAM (максимум по DIMM)
     this.gpuFans = new Map(); // имя GPU -> RPM вентилятора
     this.error = null;
   }
@@ -345,9 +475,14 @@ class HotspotPoller {
               const j = JSON.parse(line);
               if (!j) continue;
               if (j.cpu) {
-                this.cpu = j;
+                this.cpuData = j;
               } else if (j.rpm != null && j.fan) {
                 this.fans[j.fan] = Number(j.rpm);
+                if (j.ctrl != null) this.fanCtrl[j.fan] = Number(j.ctrl);
+              } else if (j.mb) {
+                this.mbData = j;
+              } else if (j.dram != null) {
+                this.dramTemp = Number(j.dram);
               } else if (j.name) {
                 this.byName.set(j.name, j);
                 if (j.fan != null) this.gpuFans.set(j.name, Number(j.fan));
@@ -389,20 +524,53 @@ class HotspotPoller {
     if (!hit && this.byName.size) hit = this.byName.values().next().value;
     return hit && hit.hotspot != null ? Number(hit.hotspot) : null;
   }
+
+  /** Температура VRAM (GPU Memory Junction) по имени GPU (авто-выбор как в valueFor). */
+  memJunctionFor(gpuName) {
+    let hit = this.byName.get(gpuName);
+    if (!hit) {
+      for (const [name, v] of this.byName) {
+        if (/3090\s*ti/i.test(name)) { hit = v; break; }
+      }
+    }
+    if (!hit && this.byName.size) hit = this.byName.values().next().value;
+    return hit && hit.memory != null ? Number(hit.memory) : null;
+  }
   /** Данные CPU (load/avg/pkg) из скрипта LibreHardwareMonitor. */
   cpu() {
-    return this.cpu;
+    return this.cpuData;
+  }
+
+  /** Датчики материнской платы (NCT6799D): температура VRM/платы, +12V/+5V/Vcore. */
+  mb() {
+    return this.mbData;
+  }
+
+  /** Температура DRAM (°C): максимум по всем DIMM. */
+  dram() {
+    return this.dramTemp;
   }
 
   /** Обороты вентилятора CPU (RPM): «CPU Fan», затем «System Fan», иначе первый доступный. */
+  /** Обороты вентилятора CPU (RPM): «Fan #2» (CPU_FAN на X670E-E), затем «CPU Fan», иначе первый доступный. */
   cpuFanRpm() {
     const names = Object.keys(this.fans);
     if (!names.length) return null;
-    let pick = names.find((n) => /cpu fan/i.test(n));
-    if (!pick) pick = names.find((n) => /system fan|sys fan/i.test(n));
+    let pick = names.find((n) => /fan\s*#2$/i.test(n));
+    if (!pick) pick = names.find((n) => /cpu fan/i.test(n));
     if (!pick) pick = names[0];
     return this.fans[pick] != null ? Number(this.fans[pick]) : null;
   }
+  /** Доля % вентилятора CPU (Control-сенсор того же вентилятора, что выбирает cpuFanRpm). */
+  cpuFanPercent() {
+    const names = Object.keys(this.fans);
+    if (!names.length) return null;
+    let pick = names.find((n) => /fan\s*#2$/i.test(n));
+    if (!pick) pick = names.find((n) => /cpu fan/i.test(n));
+    if (!pick) pick = names[0];
+    return this.fanCtrl[pick] != null ? Number(this.fanCtrl[pick]) : null;
+  }
+
 
   /** Обороты вентилятора GPU (RPM) по имени (авто-выбор как в valueFor). */
   gpuFanRpm(gpuName) {
@@ -1057,6 +1225,11 @@ function fmt(v, d) {
 function consoleLine(s) {
   const ts = new Date(s.t).toLocaleTimeString('ru-RU');
   const GB = 1024 * 1024 * 1024;
+  const clk =
+    s.cpuPdhFreq != null ? s.cpuPdhFreq
+      : s.cpuCurClock != null ? s.cpuCurClock
+        : s.cpuPstate != null ? s.cpuPstate
+          : s.cpuClock;
   const mem =
     s.memUsed != null && s.memTotal
       ? (s.memUsed / 1024).toFixed(1) + '/' + (s.memTotal / 1024).toFixed(1) + ' GB'
@@ -1080,7 +1253,13 @@ function consoleLine(s) {
     ' | вентилятор ' + fmt(s.fan) + '%' +
     ' | CPU ' + fmt(s.cpuLoad) + '%' +
     ' | CPU ' + fmt(s.cpuTemp) + '°C' +
+    ' | CPU freq ' + fmt(clk) + ' MHz' +
     ' | fan CPU ' + fmt(s.cpuFan) + ' RPM' +
+    ' | CPU ' + fmt(s.cpuPower, 1) + ' W' +
+    ' | BCLK ' + fmt(s.cpuBclk) + ' MHz' +
+    ' | DRAM ' + fmt(s.dramTemp) + '°C' +
+    ' | MB ' + fmt(s.mbTemp) + '°C' +
+    ' | VRM ' + fmt(s.vrmTemp) + '°C' +
     procs
   );
 }
@@ -1363,13 +1542,13 @@ function enableFileLogging() {
 }
 
 // Версия статических ассетов — cache-busting для кэшированного xterm.js в браузере.
-const ASSET_V = '20260930a';
+const ASSET_V = '20261101a';
 const PAGE = `<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GPU Monitor</title>
+<title>LLM Control Center</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/xterm/xterm.css">
 <style>
@@ -1382,14 +1561,16 @@ const PAGE = `<!doctype html>
   .dot.err { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
   .dot.idle { background: #8b949e; box-shadow: none; }
   h1 { font-size: 20px; margin: 0; font-weight: 600; }
-  h1 #gname { color: #4fc3f7; }
   .sub { color: #8b949e; font-size: 13px; margin-left: auto; }
-  .cards2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  .cards2 { display: grid; gap: 12px; margin-bottom: 12px; }
+  .cards-gpu { grid-template-columns: repeat(8, 1fr); }
+  .cards-cpu { grid-template-columns: repeat(8, 1fr); }
+  .rowtag { font-size: 11px; color: #6e7681; text-transform: uppercase; letter-spacing: .08em; margin: 0 0 6px; }
   .cards3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 12px; }
   .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 12px 14px; }
-  .card .label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; }
-  .card .value { font-size: 30px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
-  .card .unit { font-size: 14px; color: #8b949e; font-weight: 400; }
+  .card .label { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; }
+  .card .value { font-size: 24px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .unit { font-size: 10px; color: #8b949e; font-weight: 400; }
   .bar { height: 6px; background: #21262d; border-radius: 3px; margin-top: 8px; overflow: hidden; }
   .bar-fill { height: 100%; width: 0%; background: #4fc3f7; border-radius: 3px; transition: width .5s; }
   .note { font-size: 11px; color: #6e7681; margin-top: 6px; }
@@ -1414,7 +1595,7 @@ const PAGE = `<!doctype html>
   .log-btns { margin: 0 0 8px; }
   .log-col .llm-stats { margin-top: 10px; gap: 8px; }
   .log-col .llm-stats .card { padding: 10px 12px; }
-  .log-col .llm-stats .card .value { font-size: 24px; }
+  .log-col .llm-stats .card .value { font-size: 20px; }
   .log-col .llm-stats .card.live { border-color: #1f6feb; box-shadow: 0 0 0 1px rgba(31,111,235,.35); }
   .log-col .llm-stats .card.live .value { color: #58a6ff; }
 .log { background: #010409; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; height: 640px; overflow-y: auto; font-family: 'Cascadia Mono', Consolas, monospace; font-size: 16px; line-height: 1.19; }
@@ -1451,33 +1632,43 @@ const PAGE = `<!doctype html>
   .log-wrap { position: relative; }
   #btn-log-end, #btn-term-end { position: absolute; right: 10px; bottom: 10px; display: none; background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 8px; padding: 4px 10px; font-size: 12px; cursor: pointer; z-index: 2; }
   #btn-log-end:hover, #btn-term-end:hover { background: #30363d; }
-  @media (max-width: 720px) { .cards2, .cards3 { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 1500px) { .cards-gpu, .cards-cpu { grid-template-columns: repeat(4, 1fr); } }
+  @media (max-width: 900px) { .cards-gpu, .cards-cpu { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 520px) { .cards-gpu, .cards-cpu { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <div class="dot" id="dot"></div>
-    <h1>GPU Monitor <span id="gname"></span></h1>
+    <h1>LLM Control Center</h1>
     <div class="sub" id="updated"></div>
   </header>
   <div class="errbox" id="errbox"></div>
 
-  <div class="cards2">
-    <div class="card"><div class="label">Загрузка GPU</div><div class="value" id="v-util">—</div><div class="unit">%</div><canvas class="spark" id="s-util"></canvas></div>
+  <div class="rowtag">CPU — <span id="cpuname"></span></div>
+  <div class="cards2 cards-cpu">
     <div class="card"><div class="label">Загрузка CPU</div><div class="value" id="v-cpuload">—</div><div class="unit">%</div><canvas class="spark" id="s-cpuload"></canvas></div>
-    <div class="card"><div class="label">Выделенная память VRAM</div><div class="value" id="v-mem">—</div><div class="unit">GB</div><canvas class="spark" id="s-mem"></canvas></div>
     <div class="card"><div class="label">Выделенная память DRAM</div><div class="value" id="v-dram">—</div><div class="unit">GB</div><canvas class="spark" id="s-dram"></canvas></div>
-    <div class="card"><div class="label">Температура GPU</div><div class="value" id="v-temp">—</div><div class="unit">°C</div><canvas class="spark" id="s-temp"></canvas></div>
     <div class="card"><div class="label">Температура CPU</div><div class="value" id="v-cputemp">—</div><div class="unit">°C</div><canvas class="spark" id="s-cputemp"></canvas></div>
-    <div class="card"><div class="label">Температура горячей точки GPU</div><div class="value" id="v-hotspot">—</div><div class="unit">°C</div><canvas class="spark" id="s-hotspot"></canvas></div>
-    <div class="card"><div class="label">Температура горячей точки CPU</div><div class="value" id="v-cpuhotspot">—</div><div class="unit">°C</div><canvas class="spark" id="s-cpuhotspot"></canvas></div>
-    <div class="card"><div class="label">Обороты вентилятора GPU</div><div class="value" id="v-gpufan">—</div><div class="unit" id="u-gpufan">RPM</div><canvas class="spark" id="s-gpufan"></canvas></div>
+    <div class="card"><div class="label">Температура диода CPU (Tctl/Tdie)</div><div class="value" id="v-cpuhotspot">—</div><div class="unit">°C</div><canvas class="spark" id="s-cpuhotspot"></canvas></div>
     <div class="card"><div class="label">Обороты вентилятора CPU</div><div class="value" id="v-cpufan">—</div><div class="unit" id="u-cpufan">RPM</div><canvas class="spark" id="s-cpufan"></canvas></div>
-    <div class="card"><div class="label">Частота (SM)</div><div class="value" id="v-clock">—</div><div class="unit">MHz</div><canvas class="spark" id="s-clock"></canvas></div>
-    <div class="card"><div class="label">Мощность</div><div class="value" id="v-power">—</div><div class="unit">W</div><canvas class="spark" id="s-power"></canvas></div>
-    <div class="card"><div class="label">Лимит мощности</div><div class="value" id="v-limit">—</div><div class="unit">W</div><canvas class="spark" id="s-limit"></canvas></div>
+    <div class="card"><div class="label">Частота процессора CPU</div><div class="value" id="v-cpuclock">—</div><div class="unit" id="u-cpuclock">MHz</div><canvas class="spark" id="s-cpuclock"></canvas></div>
+    <div class="card"><div class="label">Мощность CPU</div><div class="value" id="v-cpupower">—</div><div class="unit">W</div><canvas class="spark" id="s-cpupower"></canvas></div>
+    <div class="card"><div class="label">Лимит мощности GPU</div><div class="value" id="v-limit">—</div><div class="unit">W</div><canvas class="spark" id="s-limit"></canvas></div>
   </div>
+  <div class="rowtag">GPU — <span id="gname2"></span></div>
+  <div class="cards2 cards-gpu">
+    <div class="card"><div class="label">Загрузка GPU</div><div class="value" id="v-util">—</div><div class="unit">%</div><canvas class="spark" id="s-util"></canvas></div>
+    <div class="card"><div class="label">Выделенная память VRAM</div><div class="value" id="v-mem">—</div><div class="unit">GB</div><canvas class="spark" id="s-mem"></canvas></div>
+    <div class="card"><div class="label">Температура GPU</div><div class="value" id="v-temp">—</div><div class="unit">°C</div><canvas class="spark" id="s-temp"></canvas></div>
+    <div class="card"><div class="label">Температура горячей точки GPU</div><div class="value" id="v-hotspot">—</div><div class="unit">°C</div><canvas class="spark" id="s-hotspot"></canvas></div>
+    <div class="card"><div class="label">Обороты вентилятора GPU</div><div class="value" id="v-gpufan">—</div><div class="unit" id="u-gpufan">RPM</div><canvas class="spark" id="s-gpufan"></canvas></div>
+    <div class="card"><div class="label">Частота процессора GPU</div><div class="value" id="v-clock">—</div><div class="unit">MHz</div><canvas class="spark" id="s-clock"></canvas></div>
+    <div class="card"><div class="label">Мощность GPU</div><div class="value" id="v-power">—</div><div class="unit">W</div><canvas class="spark" id="s-power"></canvas></div>
+    <div class="card"><div class="label">Температура VRAM</div><div class="value" id="v-memtemp">—</div><div class="unit">°C</div><canvas class="spark" id="s-memtemp"></canvas></div>
+  </div>
+
 
   <div class="panel">
     <div class="title">Процессы на GPU (доля VRAM на процесс)</div>
@@ -1542,7 +1733,7 @@ const PAGE = `<!doctype html>
   'use strict';
   var WINDOW_MS = 120000;
   var SPARKS = [
-    { key: 'util',       cv: 's-util',       color: '#4fc3f7', min: 0, max: 100 },
+    { key: 'util',       cv: 's-util',       color: '#81c784', min: 0, max: 100 },
     { key: 'cpuLoad',    cv: 's-cpuload',    color: '#81c784', min: 0, max: 100 },
     { key: 'util',       cv: 's-mem',        color: '#4fc3f7', min: 0, max: 100, val: function (s) { return s.memUsed != null && s.memTotal ? s.memUsed / s.memTotal * 100 : null; } },
     { key: 'util',       cv: 's-dram',       color: '#4fc3f7', min: 0, max: 100, val: function (s) { return s.dramUsed != null && s.dramTotal ? s.dramUsed / s.dramTotal * 100 : null; } },
@@ -1554,7 +1745,10 @@ const PAGE = `<!doctype html>
     { key: 'cpuFan',     cv: 's-cpufan',     color: '#4fc3f7', min: 0, max: 2500 },
     { key: 'clock',      cv: 's-clock',      color: '#81c784', min: 0, max: 2500 },
     { key: 'power',      cv: 's-power',      color: '#ffd54f', min: 0, max: 500 },
-    { key: 'powerLimit', cv: 's-limit',      color: '#8b949e', min: 0, max: 500 }
+    { key: 'cpuPower',   cv: 's-cpupower',   color: '#ffd54f', min: 0, max: 200 },
+    { key: 'powerLimit', cv: 's-limit',      color: '#8b949e', min: 0, max: 500 },
+    { key: 'cpuClock', val: (smp) => (smp.cpuPdhFreq != null ? smp.cpuPdhFreq : (smp.cpuCurClock != null ? smp.cpuCurClock : (smp.cpuPstate != null ? smp.cpuPstate : smp.cpuClock))), cv: 's-cpuclock', color: '#81c784', min: 0, max: 6000 },
+    { key: 'memTemp',    cv: 's-memtemp',    color: '#ff7043', min: 0, max: 100 }
   ];
 
   function fmt(v, d) { return v == null ? '—' : Number(v).toFixed(d == null ? 0 : d); }
@@ -1655,8 +1849,9 @@ const PAGE = `<!doctype html>
         }
         var L = d.latest;
         if (!L) return;
-        setText('gname', L.name);
-        document.title = 'GPU Monitor — ' + L.name;
+        setText('gname2', L.name);
+        setText('cpuname', L.cpuName ? L.cpuName : '—');
+        document.title = 'LLM Control Center';
         setText('v-util', fmt(L.util));
         setText('v-cpuload', fmt(L.cpuLoad));
         setText('v-temp', fmt(L.temp));
@@ -1671,10 +1866,11 @@ const PAGE = `<!doctype html>
         if (L.dramUsed != null && L.dramTotal) {
           setText('v-dram', (L.dramUsed / 1073741824).toFixed(1) + ' / ' + (L.dramTotal / 1073741824).toFixed(1));
         }
-        // Вентиляторы: RPM из LibreHardwareMonitor; если нет — доля % от NVML (GPU).
+        // Вентиляторы: RPM из LibreHardwareMonitor (+ доля % NVML для сверки);
+        // если LHM не отдаёт — доля % от NVML (GPU).
         if (L.gpuFan != null) {
           setText('v-gpufan', fmt(L.gpuFan));
-          setText('u-gpufan', 'RPM');
+          setText('u-gpufan', L.fan != null ? 'RPM · ' + L.fan + '%' : 'RPM');
         } else if (L.fan != null) {
           setText('v-gpufan', fmt(L.fan));
           setText('u-gpufan', '% (NVML)');
@@ -1684,12 +1880,29 @@ const PAGE = `<!doctype html>
         }
         if (L.cpuFan != null) {
           setText('v-cpufan', fmt(L.cpuFan));
-          setText('u-cpufan', 'RPM');
+          setText('u-cpufan', L.cpuFanPct != null ? 'RPM · ' + L.cpuFanPct + '%' : 'RPM');
         } else {
           setText('v-cpufan', '—');
           setText('u-cpufan', 'RPM');
         }
         setText('v-limit', fmt(L.powerLimit));
+        setText('v-cpupower', fmt(L.cpuPower, 1));
+        setText('v-memtemp', fmt(L.memTemp, 1));
+        if (L.cpuPdhFreq != null && L.cpuPdhFreq > 0) {
+          // «Скорость» как в диспетчере задач Windows 11 (PDH «Фактическая частота»)
+          setText('v-cpuclock', (L.cpuPdhFreq / 1000).toFixed(2));
+          setText('u-cpuclock', 'GHz');
+        } else if (L.cpuCurClock != null && L.cpuCurClock > 0) {
+          // запасной: WMI CurrentClockSpeed (среднее по ядрам)
+          setText('v-cpuclock', (L.cpuCurClock / 1000).toFixed(2));
+          setText('u-cpuclock', 'GHz');
+        } else if (L.cpuPstate != null && L.cpuPstate > 0) {
+          setText('v-cpuclock', (L.cpuPstate / 1000).toFixed(2));
+          setText('u-cpuclock', 'GHz');
+        } else {
+          setText('v-cpuclock', fmt(L.cpuClock));
+          setText('u-cpuclock', 'MHz');
+        }
         setText('updated', 'обновлено ' + new Date(L.t).toLocaleTimeString('ru-RU'));
         renderProcs(L.processes);
         var now = Date.now();
@@ -2655,14 +2868,31 @@ function main() {
     smiPath: smi,
     intervalMs: opts.intervalMs,
     gpuIndex: opts.gpu,
-    augment: (s) => {
+    augment: (s, samp) => {
       s.hotspot = hotspot.valueFor(s.name);
+      const mjt = hotspot.memJunctionFor(s.name);
+      if (mjt != null) s.memTemp = mjt;
       const c = hotspot.cpu();
+      s.cpuName = c && c.cpu ? String(c.cpu) : null;
       s.cpuLoad = c && c.load != null ? Number(c.load) : null;
-      s.cpuTemp = c && c.avg != null ? Number(c.avg) : null;
-      s.cpuHotspot = c && c.pkg != null ? Number(c.pkg) : s.cpuTemp;
+      s.cpuTemp = c && c.tdie != null ? Number(c.tdie) : null;
+      s.cpuHotspot = c && c.tctl != null ? Number(c.tctl) : s.cpuTemp;
+      s.cpuPower = c && c.power != null ? Number(c.power) : null;
+      s.cpuClock = c && c.clock != null ? Number(c.clock) : null;
+      s.cpuPstate = c && c.pstate != null ? Number(c.pstate) : null;
+      s.cpuCurClock = c && c.curclk != null ? Number(c.curclk) : null;
+      s.cpuPdhFreq = c && c.pdhfreq != null ? Number(c.pdhfreq) : null;
+      s.cpuBclk = c && c.bclk != null ? Number(c.bclk) : null;
       s.cpuFan = hotspot.cpuFanRpm();
+      s.cpuFanPct = hotspot.cpuFanPercent();
       s.gpuFan = hotspot.gpuFanRpm(s.name);
+      const mb = hotspot.mb();
+      s.vrmTemp = mb && mb.vrm != null ? Number(mb.vrm) : null;
+      s.mbTemp = mb && mb.mbtemp != null ? Number(mb.mbtemp) : null;
+      s.volt12 = mb && mb.volt12 != null ? Number(mb.volt12) : null;
+      s.volt5 = mb && mb.volt5 != null ? Number(mb.volt5) : null;
+      s.vcore = mb && mb.vcore != null ? Number(mb.vcore) : null;
+      s.dramTemp = hotspot.dram();
       const total = os.totalmem();
       s.dramTotal = total;
       s.dramUsed = total - os.freemem();
@@ -2741,7 +2971,7 @@ function main() {
 
   if (guiMode && !opts.noTray) {
     const url = 'http://' + opts.host + ':' + opts.port + '/';
-    startTrayHelper(url, 'GPU Monitor');
+    startTrayHelper(url, 'LLM Control Center');
   }
 }
 
