@@ -1,5 +1,6 @@
 # LLM Control Center (RTX 3090 Ti)
 
+![LLM Control Center — дашборд](screenshots/dashboard.png)
 Онлайн-мониторинг CPU и GPU. Дашборд переименован из «GPU Monitor» в **LLM Control Center**
 (заголовок страницы, заголовок окна, иконка в треи). Вверху страницы — две линии карточек,
 под каждым значением — спарклайн (последние 2 минуты):
