@@ -1,4 +1,4 @@
-# LLM Control Center (RTX 3090 Ti)
+# LLM Control Center
 
 ![LLM Control Center — дашборд](screenshots/dashboard.png)
 Онлайн-мониторинг CPU и GPU. Дашборд переименован из «GPU Monitor» в **LLM Control Center**
