@@ -98,7 +98,12 @@ function findNvidiaSmi() {
 /** Один опрос nvidia-smi: возвращает массив всех GPU. */
 function sampleGpus(smiPath) {
   const args = ['--query-gpu=' + FIELDS.join(','), '--format=csv,noheader,nounits'];
-  const res = spawnSync(smiPath, args, { encoding: 'utf8', timeout: 8000, windowsHide: true });
+  let res;
+  try {
+    res = spawnSync(smiPath, args, { encoding: 'utf8', timeout: 8000, windowsHide: true });
+  } catch (e) {
+    throw e;
+  }
   if (res.error) throw res.error;
   if (res.status !== 0) {
     throw new Error((res.stderr || res.stdout || '').trim() || 'nvidia-smi exited with code ' + res.status);
@@ -127,11 +132,16 @@ function sampleGpus(smiPath) {
  * Вывод:  gpu  pid  type  sm  mem  enc  dec  jpg  ofa  command
  */
 function pmonProcesses(smiPath, gpuIdx) {
-  const res = spawnSync(smiPath, ['pmon', '-c', '1', '-s', 'u'], {
-    encoding: 'utf8',
-    timeout: 8000,
-    windowsHide: true,
-  });
+  let res;
+  try {
+    res = spawnSync(smiPath, ['pmon', '-c', '1', '-s', 'u'], {
+      encoding: 'utf8',
+      timeout: 8000,
+      windowsHide: true,
+    });
+  } catch (e) {
+    return [];
+  }
   if (res.error || res.status !== 0) return [];
   const out = [];
   for (const raw of res.stdout.split(/\r?\n/)) {

@@ -29,8 +29,13 @@ const SENTINEL_FUSE = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
 const RESOURCE_NAME = 'NODE_SEA_BLOB';
 
 function sh(cmd) {
-  console.log('$ ' + cmd);
-  execSync(cmd, { stdio: 'inherit' });
+  try {
+    console.error('$ ' + cmd);
+    execSync(cmd, { stdio: 'inherit' });
+  } catch (e) {
+    console.error('Команда не выполнена: ' + (e.message || e));
+    process.exit(1);
+  }
 }
 
 // 1) SEA-бандл.
@@ -65,11 +70,11 @@ fs.copyFileSync(process.execPath, exe);
   if (oldSub !== 2) {
     buf.writeUInt16LE(2, subOff); // IMAGE_SUBSYSTEM_WINDOWS_GUI
     fs.writeFileSync(exe, buf);
-    console.log('PE subsystem: ' + oldSub + ' (консоль) -> 2 (GUI) — без окна при запуске');
+    console.error('PE subsystem: ' + oldSub + ' (консоль) -> 2 (GUI) — без окна при запуске');
   }
-  console.log('Готово: ' + exe);
-  console.log('Размер: ' + (buf.length / 1024 / 1024).toFixed(1) + ' МБ (node.exe + SEA-бандл)');
-  console.log('Запуск: gpu-monitor.exe — браузер откроется сам после старта сервера.');
+  console.error('Готово: ' + exe);
+  console.error('Размер: ' + (buf.length / 1024 / 1024).toFixed(1) + ' МБ (node.exe + SEA-бандл)');
+  console.error('Запуск: gpu-monitor.exe — браузер откроется сам после старта сервера.');
 })().catch((e) => {
   console.error(e.message);
   process.exit(1);
