@@ -28,8 +28,7 @@
                      "npm:@plannotator/pi-extension",
                      "npm:pi-code-previews",
                      "git:github.com/IzumiSy/pi-file-tree-browser",
-                     "npm:pi-editor",
-                     "npm:pi-nvim"
+                     "npm:pi-editor"
                  ],
     "images":  {
                    "autoResize":  true
