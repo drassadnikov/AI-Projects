@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ]
+    },
+    "chrome-devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest"
+      ]
+    },
+    "postgres": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres@latest",
+        "postgresql://login:pass@localhost:5432/test_db"
+      ],
+      "description": "PostgreSQL (local docker-compose rpcd-autotests: test_db). Tool: query (SQL, readonly по умолчанию)."
+    }
+  }
+}

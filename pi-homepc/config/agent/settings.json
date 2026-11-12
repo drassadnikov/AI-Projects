@@ -1,0 +1,65 @@
+{
+  "defaultProvider": "llama.cpp",
+  "defaultModel": "qwen3.8-27b",
+  "defaultThinkingLevel": "off",
+  "telemetry": false,
+  "offlineMode": true,
+  "hideThinkingBlock": true,
+  "lastChangelogVersion": "1.4.0",
+  "theme": "dark",
+  "terminal": {
+    "showTerminalProgress": true,
+    "clearOnShrink": true
+  },
+  "packages": [
+    "A:\\PROJECTS\\pi-homepc",
+    "npm:pi-hashline-edit-pro",
+    "npm:pi-web-access",
+    "npm:bigpowers",
+    "npm:pi-powerline-footer",
+    "npm:@moyai/pi-session-hoarder",
+    "npm:@amaster.ai/pi-memory-mem0",
+    "npm:pi-web-ui",
+    "npm:pi-prompt-template-model",
+    "npm:pi-lsp-extension",
+    "npm:pi-fff",
+    "npm:pi-nvim"
+  ],
+  "images": {
+    "autoResize": true
+  },
+  "showHardwareCursor": true,
+  "editorPaddingX": 1,
+  "transport": "auto",
+  "markdown": {
+    "mermaid": "streaming"
+  },
+  "compaction": {
+    "reserveTokens": 65536
+  },
+  "defaultTools": [
+    "+codemode"
+  ],
+  "pi-memory-mem0": {
+    "mode": "embedded",
+    "autoCapture": false,
+    "oss": {
+      "llm": {
+        "provider": "vllm",
+        "config": {
+          "model": "qwen3.8-27b",
+          "baseURL": "http://192.168.1.117:9931/v1",
+          "apiKey": "local-bypass"
+        }
+      },
+      "embedder": {
+        "provider": "fastembed",
+        "config": {
+          "model": "fast-multilingual-e5-large"
+        }
+      }
+    }
+  },
+  "doubleEscapeAction": "tree",
+  "deviceId": "5b2fe2b8-c119-4c15-84bb-f86bedac2a25"
+}

@@ -1,0 +1,1479 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Type } from "typebox";
+
+import { execObsidian } from "./lib/cli";
+import {
+  formatSearchResults,
+  formatTasks,
+  formatTasksFiltered,
+  formatTags,
+  formatLinks,
+  formatOutline,
+  formatOutgoingLinks,
+  formatFileInfo,
+  formatProperties,
+  formatAliases,
+  formatWordCount,
+} from "./lib/format";
+
+// ---------------------------------------------------------------------------
+// Vault guard
+// ---------------------------------------------------------------------------
+
+export function obsidianVaultRoot(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  let dir = resolve(cwd);
+  while (true) {
+    try {
+      if (statSync(join(dir, ".obsidian")).isDirectory()) return dir;
+    } catch { /* keep walking */ }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+export function isObsidianVaultCwd(cwd: string | undefined): boolean {
+  return Boolean(obsidianVaultRoot(cwd));
+}
+
+function canonicalPath(path: string): string {
+  let existing = resolve(path);
+  const missing: string[] = [];
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) break;
+    missing.unshift(basename(existing));
+    existing = parent;
+  }
+  return resolve(realpathSync(existing), ...missing);
+}
+
+export function isPathInObsidianVault(path: string | undefined, cwd: string, vaultRoot = obsidianVaultRoot(cwd)): boolean {
+  if (!path || !vaultRoot) return false;
+  const fromRoot = relative(canonicalPath(vaultRoot), canonicalPath(resolve(cwd, path)));
+  return fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot);
+}
+
+export function parseVaultInfo(output: string): { name: string; path: string } | undefined {
+  const name = output.match(/^name\s+(.+)$/m)?.[1]?.trim();
+  const path = output.match(/^path\s+(.+)$/m)?.[1]?.trim();
+  return name && path ? { name, path } : undefined;
+}
+
+export function vaultNameForCwd(cwd: string | undefined, active: { name: string; path: string } | undefined): string | undefined {
+  const root = obsidianVaultRoot(cwd);
+  return root && active && resolve(active.path) === root ? active.name : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Focused-vault lookup — one memoized `obsidian vault` spawn per process
+// ---------------------------------------------------------------------------
+
+let _vaultLookup: { info?: { name: string; path: string }; error?: unknown } | null = null;
+
+function vaultLookup(): { info?: { name: string; path: string }; error?: unknown } {
+  if (_vaultLookup === null) {
+    let info: { name: string; path: string } | undefined;
+    try {
+      info = parseVaultInfo(execObsidian(["vault"]).stdout);
+    } catch (e) {
+      // Success is memoized; failure is NOT — a session started before the
+      // Obsidian app launches must recover once it does (pre-0.8.16 behavior
+      // retried per call; caching the error would make the failure permanent).
+      return { error: e };
+    }
+    if (!info) {
+      // Exit 0 but unparseable output (e.g. app mid-startup) — same rule:
+      // treat as "unknown this call", retry later, never cache.
+      return {};
+    }
+    _vaultLookup = { info };
+  }
+  return _vaultLookup;
+}
+
+function focusedVaultNameForCwd(cwd: string | undefined): string | undefined {
+  const { info, error } = vaultLookup();
+  if (error) throw error; // unchanged: name lookup surfaces CLI failure
+  return vaultNameForCwd(cwd, info);
+}
+
+/**
+ * Lazily cached list of all known vault root paths.
+ * Only the focused vault; multi-vault enumeration needs obsidian vault list --all.
+ * CLI failure (e.g. app not running) → no roots, same as before.
+ */
+function allVaultRoots(): string[] {
+  const { info } = vaultLookup();
+  return info ? [info.path] : [];
+}
+
+export function redirectionDestination(command: string): string | undefined {
+  let quote = "";
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote) {
+      if (char === quote && command[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === ">") return parseCliString(command.slice(i + (command[i + 1] === ">" ? 2 : 1)).trim())[0];
+  }
+  return undefined;
+}
+
+// HOME-PC vendoring patch: read-only commands are safe to run against vault
+// paths (they cannot modify files). The guard's purpose is data-loss
+// prevention, so reads are allowed and writes (including unknown commands)
+// are still blocked.
+const READONLY_COMMANDS = new Set([
+  "ls", "find", "cat", "head", "tail", "grep", "rg", "ag", "ack",
+  "du", "wc", "file", "stat", "sort", "uniq", "cut", "tr", "diff",
+  "md5sum", "sha1sum", "sha256sum", "xxd", "od", "realpath", "basename", "dirname",
+]);
+
+/** Split a compound command into segments on ; | & ` $ ( ) outside quotes. */
+function splitShellSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let quote = "";
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote) {
+      current += char;
+      if (char === quote && command[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (";|&`$()".includes(char)) {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  segments.push(current);
+  return segments;
+}
+
+/** Single (non-compound) command: does it write to the vault? */
+function isSingleCommandVaultWrite(command: string, cwd: string, vaultRoot: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+  // Any output redirect into the vault is a write, regardless of the command.
+  const redir = redirectionDestination(trimmed);
+  if (redir && isPathInObsidianVault(redir, cwd, vaultRoot)) return true;
+  const tokens = parseCliString(trimmed);
+  while (tokens[0] === "command" || tokens[0] === "env") tokens.shift();
+  while (tokens[0]?.startsWith("-")) tokens.shift();
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? "")) tokens.shift();
+  const commandName = basename(tokens.shift() ?? "");
+  if (!commandName) return false;
+  const args = tokens;
+  const targets = (values: string[]) => values.filter((value) => !value.startsWith("-"));
+  const hasVaultTarget = (values: string[]) => values.some((value) => isPathInObsidianVault(value, cwd, vaultRoot));
+  const inPlaceFiles = (values: string[]) => {
+    let programSeen = false;
+    const files: string[] = [];
+    for (let i = 0; i < values.length; i++) {
+      if (values[i] === "-e") { i++; programSeen = true; continue; }
+      if (values[i].startsWith("-")) continue;
+      if (!programSeen) { programSeen = true; continue; }
+      files.push(values[i]);
+    }
+    return files;
+  };
+
+  if (/^(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|build|lint)|build|lint)\b/.test(trimmed)
+    || /^git\s+(?:status|diff|log|branch)\b/.test(trimmed)
+    || /^(?:node|python|python3)\s+--version\b/.test(trimmed)
+    || ["pwd", "which"].includes(commandName)) return false;
+  // Read-only commands may touch vault paths. `ls`/`find` without an explicit
+  // location list the cwd — block only when the cwd itself is inside the vault.
+  if (READONLY_COMMANDS.has(commandName)) {
+    if (["ls", "find"].includes(commandName) && targets(args).length === 0) {
+      return isPathInObsidianVault(cwd, cwd, vaultRoot);
+    }
+    return false;
+  }
+  if (["cp", "mv", "rm", "touch", "mkdir", "rmdir", "tee", "unlink"].includes(commandName)) return hasVaultTarget(targets(args));
+  if (commandName === "truncate") return hasVaultTarget(targets(args).filter((value) => !/^\d+$/.test(value)));
+  if (["echo", "printf"].includes(commandName)) return isPathInObsidianVault(redirectionDestination(trimmed), cwd, vaultRoot);
+  if (["sed", "perl"].includes(commandName) && args.some((value) => /^-i(?:.|$)|^--in-place(?:=|$)/.test(value))) return hasVaultTarget(inPlaceFiles(args));
+  return true;
+}
+
+export function isVaultFilesystemBashCommand(command: unknown, cwd: string, vaultRoot = obsidianVaultRoot(cwd)): boolean {
+  if (typeof command !== "string" || !vaultRoot) return false;
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+  // Evaluate each segment of a compound command independently so a chain like
+  // `ls C:/x; du -sh K:/vault` is no longer blocked wholesale.
+  return splitShellSegments(trimmed).some((segment) => isSingleCommandVaultWrite(segment, cwd, vaultRoot));
+}
+
+/**
+ * Literal-mark helper for the cross-vault guard: does the command reference the
+ * vault root or its `.obsidian` dir, with `..`-relative paths resolved against
+ * cwd first (so `rm ../MyVault/x.md` is caught when cwd is a sibling of the
+ * vault). Mirrors the CLI-printed-root normalization (#4) and Windows case
+ * folding. `isVaultFilesystemBashCommand` already resolves `..`; this exists
+ * only so the cross-vault branch's literal pre-check doesn't discard its verdict.
+ */
+export function commandMentionsVaultPath(command: string, cwd: string, vaultRoot: string): boolean {
+  const norm = (s: string) =>
+    (process.platform === "win32" ? s.toLowerCase() : s).replace(/[\\/]+/g, sep);
+  const matchesRoot = (p: string) => {
+    const resolved = norm(resolve(cwd, p));
+    // .obsidian needs no separate clause: any path under the vault (including
+    // <root>/.obsidian) already matches the root+sep prefix below.
+    return resolved === norm(vaultRoot) || resolved.startsWith(norm(vaultRoot) + sep);
+  };
+  if (parseCliString(command).some((t) => matchesRoot(t))) return true;
+  // Redirection targets aren't plain tokens (`echo x > ../V/n.md`).
+  const dest = redirectionDestination(command);
+  return dest !== undefined && matchesRoot(dest);
+}
+
+// ---------------------------------------------------------------------------
+// CLI string parser
+// ---------------------------------------------------------------------------
+
+// quote='"' decodes \n/\t/\r/\" escapes; quote="'" is literal (shell-faithful,
+// no escape decoding) — avoids \n-decode footgun in JS code passed to eval.
+export function readQuotedContent(s: string, pos: number, quote = '"'): { value: string; endPos: number } {
+  let val = "";
+  // ponytail: single-quote fast path — read literally until the closing quote.
+  if (quote === "'") {
+    while (pos < s.length && s[pos] !== quote) val += s[pos++];
+    return { value: val, endPos: pos };
+  }
+  while (pos < s.length && s[pos] !== quote) {
+    if (s[pos] === "\\" && pos + 1 < s.length) {
+      const next = s[pos + 1];
+      if (next === '"' || next === "\\") {
+        pos++; val += s[pos++];
+      } else if (next === "n") { pos += 2; val += "\n"; }
+      else if (next === "t") { pos += 2; val += "\t"; }
+      else if (next === "r") { pos += 2; val += "\r"; }
+      else { val += s[pos++]; } // passthrough unknown escapes
+    } else {
+      val += s[pos++];
+    }
+  }
+  return { value: val, endPos: pos };
+}
+
+export function parseCliString(s: string): string[] {
+  const args: string[] = [];
+  const isQuote = (c: string) => c === '"' || c === "'";
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (i >= s.length) break;
+    let val = "";
+    if (isQuote(s[i])) { const q = s[i++]; const r = readQuotedContent(s, i, q); val = r.value; i = r.endPos + 1; }
+    else {
+      while (i < s.length && !/\s/.test(s[i])) {
+        if (isQuote(s[i])) { const q = s[i++]; const r = readQuotedContent(s, i, q); val += r.value; i = r.endPos + 1; }
+        else { val += s[i++]; }
+      }
+    }
+    args.push(val);
+  }
+  return args;
+}
+
+export function parseFlags(s: string): Record<string, string> {
+  const flags: Record<string, string> = {};
+  // Use parseCliString so escape sequences (\n, \t) are handled consistently
+  const args = parseCliString(s);
+  for (const arg of args) {
+    const eqIdx = arg.indexOf("=");
+    if (eqIdx > 0) {
+      flags[arg.slice(0, eqIdx)] = arg.slice(eqIdx + 1);
+    }
+  }
+  return flags;
+}
+
+// ---------------------------------------------------------------------------
+// Write note content via base64-encoded eval.
+//
+// The Obsidian CLI's content= parser only understands \n and \t escapes —
+// backslashes, quotes, pipes, and literal \n all get corrupted.  And on
+// Windows the argv ceiling (~8 KB) silently truncates large payloads.
+// Base64-encoding the content and decoding inside eval eliminates BOTH
+// problems: no escaping needed, and large content is split into safe
+// base64 chunks that are reassembled via adapter.read+adapter.write
+// (the lower-level DataAdapter, which does NOT go through the vault
+// modify/sync pipeline that can deadlock on open+synced files).
+// ---------------------------------------------------------------------------
+
+/** Decode a base64 string to UTF-8 inside the Obsidian app context. */
+const b64Decode = (chunk: string) =>
+  `new TextDecoder('utf-8').decode(Uint8Array.from(atob(${JSON.stringify(chunk)}),c=>c.charCodeAt(0)))`;
+
+/** Wrap an async script body in try/catch so errors are returned on stdout, not lost. */
+const wrapEval = (body: string) =>
+  `(async function(){try{${body}}catch(e){return 'Error: '+String(e&&e.message||e)}})()`;
+
+/** Ensure parent folders exist before writing. */
+const ensureFolder = (notePath: string) =>
+  `const p=${JSON.stringify(notePath)}.replace(/\\\\/g,'/').split('/').slice(0,-1).join('/');` +
+  `if(p&&!app.vault.getAbstractFileByPath(p))await app.vault.createFolder(p,true);`;
+
+/**
+ * Close any open editor view of this file (prevents the "File changed" reload modal
+ * that blocks all subsequent evals) and ensure parent folders exist.
+ */
+const prepare = (notePath: string) => {
+  const t = JSON.stringify(notePath);
+  return (
+    `const _lv=app.workspace.getLeavesOfType('markdown');` +
+    `for(const _x of _lv){try{const _s=_x.getViewState&&_x.getViewState();` +
+    `if(_s&&_s.state&&_s.state.file===${t})await _x.detach();}catch(_){}}` +
+    ensureFolder(notePath)
+  );
+};
+
+/** Build the chunk-0 eval script for the given mode and base64 chunk. */
+export function buildFirstScript(
+  notePath: string,
+  mode: "create" | "overwrite" | "append" | "prepend",
+  b64Chunk0: string
+): string {
+  const t = JSON.stringify(notePath);
+  const tn = `t.replace(/\\\\/g,'/')`; // normalized path for adapter calls
+  const c0 = b64Decode(b64Chunk0);
+  let body: string;
+  if (mode === "create") {
+    body = `const t=${t};const tn=${tn};if(app.vault.getAbstractFileByPath(t))throw new Error('File already exists: '+t);${prepare(notePath)}await app.vault.adapter.write(tn,${c0});return 'ok'`;
+  } else if (mode === "overwrite") {
+    body = `const t=${t};const tn=${tn};${prepare(notePath)}await app.vault.adapter.write(tn,${c0});return 'ok'`;
+  } else if (mode === "append") {
+    body = `const t=${t};const tn=${tn};const c=${c0};const e=app.vault.getAbstractFileByPath(t);if(e){const o=await app.vault.adapter.read(tn);await app.vault.adapter.write(tn,o+c);return 'ok'}${prepare(notePath)}await app.vault.adapter.write(tn,c);return 'ok'`;
+  } else { // prepend
+    body = `const t=${t};const tn=${tn};const c=${c0};const e=app.vault.getAbstractFileByPath(t);if(e){const o=await app.vault.adapter.read(tn);const m=o.match(/^---\\s*\\n[\\s\\S]*?\\n---\\s*\\n/);const i=m?m[0].length:0;await app.vault.adapter.write(tn,o.slice(0,i)+c+o.slice(i));return 'ok'}${prepare(notePath)}await app.vault.adapter.write(tn,c);return 'ok'`;
+  }
+  return wrapEval(body);
+}
+
+/** Build a chunk-append eval script for chunks 1..N. */
+export function buildChunkScript(notePath: string, b64Chunk: string): string {
+  const t = JSON.stringify(notePath);
+  const tn = `t.replace(/\\\\/g,'/')`;
+  return wrapEval(`const t=${t};const tn=${tn};const f=app.vault.getAbstractFileByPath(t);if(!f)throw new Error('File not found after chunk 0');const o=await app.vault.adapter.read(tn);await app.vault.adapter.write(tn,o+${b64Decode(b64Chunk)});return 'ok'`);
+}
+
+/**
+ * Build a prepend chunk eval for chunks 1..N on an existing file: inserts the
+ * chunk after the frontmatter block plus the already-inserted prefix (offset),
+ * keeping all prepended chunks contiguous before the old content.
+ * (buildChunkScript appends to the END, which would sandwich old content
+ * between prepend chunks — a corruption for multi-chunk prepend.)
+ */
+export function buildPrependChunkScript(notePath: string, b64Chunk: string, insertOffset: number): string {
+  const t = JSON.stringify(notePath);
+  const tn = `t.replace(/\\\\/g,'/')`;
+  return wrapEval(`const t=${t};const tn=${tn};const f=app.vault.getAbstractFileByPath(t);if(!f)throw new Error('File not found after chunk 0');const o=await app.vault.adapter.read(tn);const m=o.match(/^---\\s*\\n[\\s\\S]*?\\n---\\s*\\n/);const i=m?m[0].length:0;const at=i+${insertOffset};await app.vault.adapter.write(tn,o.slice(0,at)+${b64Decode(b64Chunk)}+o.slice(at));return 'ok'`);
+}
+
+/** Compute a djb2 hash + byte length for a UTF-8 string, matching the in-eval formula. */
+export function djb2Utf8(s: string): { hash: number; bytes: number } {
+  // ponytail: djb2 length+hash; full-content compare if a collision ever bites
+  const buf = Buffer.from(s, "utf8");
+  let h = 5381;
+  for (let i = 0; i < buf.length; i++)
+    h = ((h << 5) + h + buf[i]) >>> 0;
+  return { hash: h, bytes: buf.length };
+}
+
+/**
+ * Write note content via base64-encoded eval.  Handles create, overwrite,
+ * append, and prepend modes.  Splits large content into base64 chunks that
+ * each fit in a single eval call, reassembling via adapter.read+adapter.write.
+ *
+ * After all chunks are written, a read-back verification via the `obsidian read`
+ * CLI command confirms the content landed (eval echo is unreliable when the
+ * async body does real I/O — especially on SMB/network mounts), decoupling
+ * success from what the CLI eval echoes.
+ *
+ * Throws on any failure (empty output, eval "Error:" prefix, or verification
+ * mismatch).
+ */
+export function vaultWrite(
+  notePath: string,
+  content: string,
+  mode: "create" | "overwrite" | "append" | "prepend",
+  vault?: string,
+  timeoutMs = 60_000,
+  exec: (args: string[], formatJson?: boolean, timeoutMs?: number) => { stdout: string; stderr: string; parsed: unknown } = execObsidian
+): string {
+  const j = JSON.stringify;
+  // Adaptive chunk size: Obsidian 1.13.x is unreliable for eval scripts above
+  // ~3200 chars — it HANGS (wedging the app, ~3300-3900) or rejects (exit 1,
+  // ≥4000) or silently no-ops. Script size = fixed per-mode overhead (worst:
+  // prepend first-chunk ≈ 825) + 3×pathLen (path is embedded in const t=,
+  // prepare(), ensureFolder) + 4/3×decodedBytes (base64). Size chunks so the
+  // worst script stays ≤ ~3000 regardless of path length.
+  const SAFE_SCRIPT_LEN = 3000;
+  const pathLen = j(notePath).length;
+  const worstOverhead = 825 + 3 * pathLen; // prepend first-chunk
+  const maxDecodedPerChunk = Math.max(256, Math.floor((SAFE_SCRIPT_LEN - worstOverhead) / 1.34));
+  // base64 chars per chunk; MUST be a multiple of 4 so every slice is a valid
+  // standalone base64 unit (slicing mid-quad drops bytes on decode).
+  const chunkB64Size = Math.floor((maxDecodedPerChunk / 3) * 4 / 4) * 4;
+  // Split on UTF-8 CHARACTER boundaries: each chunk is decoded independently in
+  // the eval, and a multi-byte char (emoji/CJK) split across two chunks would
+  // decode to U+FFFD replacement chars in both. Walk the UTF-8 bytes and only
+  // cut at a boundary where the next byte is not a continuation byte (0x80-0xBF).
+  const utf8 = Buffer.from(content, "utf8");
+  const b64Chunks: string[] = [];
+  const maxDecodedBytes = Math.floor(chunkB64Size / 4) * 3;
+  let pos = 0;
+  while (pos < utf8.length) {
+    let end = Math.min(pos + maxDecodedBytes, utf8.length);
+    // back up to a character boundary (end may equal utf8.length → fine)
+    while (end < utf8.length && end > pos && (utf8[end] & 0xc0) === 0x80) end--;
+    if (end === pos) end = Math.min(pos + maxDecodedBytes, utf8.length); // safety: no boundary found
+    b64Chunks.push(utf8.slice(pos, end).toString("base64"));
+    pos = end;
+  }
+  if (b64Chunks.length === 0) b64Chunks.push("");
+
+  // Obsidian 1.13.x corrupts the eval payload when large evals run back-to-back
+  // (rapid successive calls → atob "not correctly encoded" errors). Space them
+  // out with a short sync delay. 75ms is ample; the CLI round-trip is ~50-150ms.
+  const EVAL_GAP_MS = 75;
+  let _lastEvalAt = 0;
+  const evalGap = () => {
+    const now = Date.now();
+    const wait = EVAL_GAP_MS - (now - _lastEvalAt);
+    if (wait > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+    _lastEvalAt = Date.now();
+  };
+
+  const run = (script: string, label: string, tolerant = false, mode?: "create" | "overwrite" | "append" | "prepend"): string => {
+    // ponytail: hard guard against transport truncation. Obsidian 1.13.x hangs
+    // (~3200-3900 chars, wedging the app) or fails (≥4000) eval scripts, so
+    // this backstop fires at 3100 — before the hang zone — with a clear error.
+    // Adaptive chunking keeps scripts ≤ ~3000; this catches any regression.
+    if (script.length > 3100) throw new Error(`eval payload ${script.length} bytes exceeds the Obsidian eval ceiling (~3100 chars; hangs/fails beyond); reduce content chunk size or shorten the note path`);
+    const args: string[] = [];
+    if (vault) args.push(`vault=${vault}`);
+    args.push("eval", `code=${script}`);
+    evalGap();
+    let result = exec(args, false, timeoutMs);
+    let out = result.stdout.trim().replace(/^=>\s?/, "");
+    let stderr = (result.stderr || "").trim();
+    // Verify steps are strict but read-only and idempotent: the 1.13.x race
+    // occasionally drops their echo too, so retry once on empty before failing.
+    if (!tolerant && !out && !stderr) {
+      result = exec(args, false, timeoutMs);
+      out = result.stdout.trim().replace(/^=>\s?/, "");
+      stderr = (result.stderr || "").trim();
+    }
+    // Write steps: Obsidian 1.13.x intermittently corrupts the code= payload in
+    // transit (atob: "string to be decoded is not correctly encoded") or drops
+    // the echo. Retry once on a transient Error:/empty. If the retry also
+    // errors, do NOT fail here for tolerant steps — the write may have
+    // succeeded anyway (e.g. create → "File already exists" means chunk 0
+    // landed); the read-back verify step is the real gate.
+    // append/prepend are non-idempotent: re-executing a step whose echo was
+    // merely lost duplicates a write that already landed, and tail/prefix
+    // verification cannot detect the extra copy — mirror the whole-write
+    // retry policy below (idempotent modes only) and let the read-back
+    // verify step judge the real file state instead.
+    if (tolerant && mode !== "append" && mode !== "prepend" && (/^Error[:\s]/.test(out) || (!out && !stderr))) {
+      const firstOut = out;
+      result = exec(args, false, timeoutMs);
+      out = result.stdout.trim().replace(/^=>\s?/, "");
+      stderr = (result.stderr || "").trim();
+      if (/^Error[:\s]/.test(out) || (!out && !stderr)) {
+        // ambiguous retry: keep the first result; verify step decides
+        out = firstOut;
+      }
+    }
+    // Write-step evals on Obsidian 1.13.x intermittently lose the resolved
+    // value on a successful new-file write (vault reindex races the result
+    // printer) while the write itself succeeds, or corrupt the payload (atob
+    // error) without writing. For tolerant write steps, ANY non-stderr outcome
+    // (empty echo, atob Error:, File already exists) is left to the read-back
+    // verify step to judge — it distinguishes wrote-vs-not definitively.
+    // stderr is a hard failure for write steps; verify steps (strict) judge
+    // the returned content directly.
+    const failed = tolerant
+      ? !!stderr
+      : !out || /^Error[:\s]/.test(out);
+    if (failed) {
+      throw new Error(
+        `vaultWrite ${label} failed for "${notePath}": ${out || "(no output)"}` +
+        (stderr ? `\n  Stderr: ${stderr.slice(0, 500)}` : "") +
+        `\n  Script: ${script.slice(0, 200).replace(/\n/g, "\\n")}...`
+      );
+    }
+    return out;
+  };
+
+  // --- write + verify, retried once on verification failure ---
+  // Obsidian 1.13.x intermittently drops a chunk's write (silent no-op) during
+  // multi-chunk writes. The verify step catches it; retrying the whole write
+  // repairs it (writes are idempotent; an explicit "File already exists" for a
+  // pre-existing file now throws fast via the fail-fast check below, so the
+  // create->overwrite retry only happens when the first write was silently
+  // dropped and the file is still absent). Max 2 attempts — a persistent
+  // mismatch is a real error.
+  let attempts = 0;
+  for (;;) {
+    attempts++;
+    const effectiveMode = attempts > 1 && mode === "create" ? "overwrite" : mode;
+
+    // --- first chunk: mode-specific initial write (tolerant: 1.13.x write echo can be empty; verify step is the real gate) ---
+    const firstOut = run(buildFirstScript(notePath, effectiveMode, b64Chunks[0]), effectiveMode, true, effectiveMode);
+    // Create on an existing file: surface the clear error instead of letting
+    // it degrade into an opaque verification mismatch.
+    if (effectiveMode === "create" && /File already exists/.test(firstOut)) {
+      throw new Error(`vaultWrite create failed for "${notePath}": ${firstOut}`);
+    }
+
+    // --- remaining chunks: read + insert (prepend keeps chunks contiguous before
+    // old content) or read + append to end (create/overwrite/append). Tolerant:
+    // 1.13.x write echo can be empty; verify step is the real gate. ---
+    let prependOffset = effectiveMode === "prepend" ? Buffer.from(b64Chunks[0], "base64").toString("utf8").length : 0;
+    for (let i = 1; i < b64Chunks.length; i++) {
+      if (effectiveMode === "prepend") {
+        run(buildPrependChunkScript(notePath, b64Chunks[i], prependOffset), `chunk ${i}`, true, effectiveMode);
+        prependOffset += Buffer.from(b64Chunks[i], "base64").toString("utf8").length;
+      } else {
+        run(buildChunkScript(notePath, b64Chunks[i]), `chunk ${i}`, true, effectiveMode);
+      }
+    }
+
+    // --- verify: read back via CLI and confirm content externally ---
+    // Obsidian 1.13.x drops eval echo when the async body involves real I/O
+    // (adapter.read, setTimeout) — especially on SMB/network mounts where I/O
+    // latency exceeds the CLI's internal eval-result timeout. The `obsidian read`
+    // CLI command uses a different code path and is reliable. We read the file
+    // content here and compute the hash externally in Node.js.
+    let verifyError: Error | undefined;
+    try {
+      const readArgs: string[] = [];
+      if (vault) readArgs.push(`vault=${vault}`);
+      readArgs.push("read", `path=${notePath}`);
+      // Retry read up to 3 times with a short gap — SMB/network mounts have
+      // write-visibility propagation delays that can make a just-written file
+      // appear empty on immediate re-read.
+      let fileContent = "";
+      let readError = "";
+      for (let rAttempt = 0; rAttempt < 3; rAttempt++) {
+        if (rAttempt > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+        try {
+          // No "=>" prefix stripping: that decoration is eval-only. `read`
+          // prints raw content, so a note legitimately starting with "=>"
+          // must survive byte-exact.
+          const rr = exec(readArgs, false, timeoutMs);
+          fileContent = rr.stdout;
+          readError = rr.stderr || "";
+        } catch (e) {
+          // execObsidian throws on non-zero exit (e.g. missing file). Treat as
+          // an empty read and keep retrying; the friendly error below fires
+          // only if every attempt fails.
+          fileContent = "";
+          readError = e instanceof Error ? e.message : String(e);
+        }
+        // Break when we have content, or when the expected read-back IS empty:
+        // - non-empty content: the target SMB case is empty stdout WITHOUT
+        //   stderr (write-visibility propagation delay / CLI drops the echo)
+        //   — that must retry until content appears.
+        // - empty-content create/overwrite: the note legitimately reads back
+        //   "", so burning the remaining attempts + 500ms sleeps before the
+        //   passing compare would be wasted.
+        // - a *throwing* read (readError set) is a genuine I/O failure, not an
+        //   empty note — keep retrying it even for empty content.
+        const expectEmpty = !content && (effectiveMode === "create" || effectiveMode === "overwrite");
+        if (fileContent.length > 0 || (expectEmpty && !readError)) break;
+      }
+      if (!fileContent && readError) {
+        throw new Error(`vaultWrite ${effectiveMode} verification failed for "${notePath}": file not found or unreadable (${readError.replace(/\s+/g, " ").slice(0, 200)})`);
+      }
+      // CLI `read` prints file content byte-exact, EXCEPT the printer appends
+      // exactly one trailing "\n" when the content is non-empty and does not
+      // already end with "\n" (empirically verified on SMB vaults; adapter.write
+      // itself round-trips byte-exact). Invert that rule before comparing so
+      // notes ending in "\n" don't false-fail and notes without one don't pick
+      // up the printer's newline.
+      // Consequence: the printer destroys the final-newline bit, so tail
+      // verify is newline-blind at the tail — appending "abc" vs "abc\n"
+      // verifies identically (inherent to the transport; do not assume
+      // byte-strictness there).
+      const normalizeCliRead = (s: string) => (s.length > 0 && !s.endsWith("\n") ? s + "\n" : s);
+      // Obsidian CLI reports missing files on STDOUT with exit 0
+      // (`Error: File "..." not found.`). Surface that in mismatch messages.
+      const readHint = /^Error: File .* not found\./.test(fileContent)
+        ? `; read returned: "${fileContent.trim().slice(0, 120)}"`
+        : "";
+
+      if (effectiveMode === "create" || effectiveMode === "overwrite") {
+        // Hashing the full raw stdout is safe for real notes: execObsidian
+        // (lib/cli.ts) strips known CLI log lines ("Loading updated app
+        // package", outdated-installer notice) before we see them. Residual
+        // risk: a note whose own content matches one of those patterns would
+        // be filtered and false-fail — vanishingly unlikely, accepted.
+        const expected = djb2Utf8(normalizeCliRead(content));
+        const actual = djb2Utf8(fileContent);
+        if (actual.hash !== expected.hash || actual.bytes !== expected.bytes) {
+          throw new Error(
+            `vaultWrite ${effectiveMode} verification failed for "${notePath}": ` +
+            `written ${actual.bytes} bytes (hash ${actual.hash}), expected ${expected.bytes} bytes (hash ${expected.hash})${readHint}`
+          );
+        }
+      } else if (effectiveMode === "append") {
+        if (!content) break; // empty append is a no-op
+        const expectedTail = normalizeCliRead(content);
+        const tail = fileContent.slice(-expectedTail.length);
+        const expected = djb2Utf8(expectedTail);
+        const actual = djb2Utf8(tail);
+        if (actual.hash !== expected.hash || actual.bytes !== expected.bytes) {
+          throw new Error(
+            `vaultWrite ${effectiveMode} verification failed for "${notePath}": ` +
+            `tail ${actual.bytes} bytes (hash ${actual.hash}), expected ${expected.bytes} bytes (hash ${expected.hash})${readHint}`
+          );
+        }
+      } else {
+        // Prepend: verify the prepended content appears at the start (after frontmatter)
+        const contentUnits = content.length;
+        let body = fileContent;
+        const fmMatch = body.match(/^---\s*\n[\s\S]*?\n---\s*\n/);
+        if (fmMatch) body = body.slice(fmMatch[0].length);
+        const head = body.slice(0, contentUnits);
+        const expected = djb2Utf8(content);
+        const actual = djb2Utf8(head);
+        if (actual.hash !== expected.hash || actual.bytes !== expected.bytes) {
+          throw new Error(
+            `vaultWrite ${effectiveMode} verification failed for "${notePath}": ` +
+            `head ${actual.bytes} bytes (hash ${actual.hash}), expected ${expected.bytes} bytes (hash ${expected.hash})${readHint}`
+          );
+        }
+      }
+    } catch (e) {
+      verifyError = e as Error;
+    }
+    if (!verifyError) break; // verified OK
+    // Retry only for idempotent modes (create→overwrite, overwrite). append/
+    // prepend are NON-idempotent: re-running the write would duplicate content
+    // (OLD+content+content), and tail/prefix verify cannot detect the extra
+    // copy. For those, surface the verify error immediately — the caller can
+    // retry the whole operation.
+    if (attempts >= 2 || mode === "append" || mode === "prepend") throw verifyError;
+    // transient chunk-drop race: retry the whole write once (idempotent modes only)
+  }
+
+  // Return a bridge-constructed success message (decoupled from eval echo)
+  const modeLabels: Record<string, string> = {
+    create: "Created",
+    overwrite: "Updated",
+    append: "Appended to",
+    prepend: "Prepended to",
+  };
+  return `${modeLabels[mode]}: ${notePath}`;
+}
+
+// ---------------------------------------------------------------------------
+// Higher-level operations via single eval calls
+// ---------------------------------------------------------------------------
+
+export function listFilesRecursive(
+  folder: string,
+  vault?: string,
+  timeoutMs = 30_000,
+  exec: (args: string[], formatJson?: boolean, timeoutMs?: number) => { stdout: string; stderr: string; parsed: unknown } = execObsidian,
+  rootOnly = false
+): string {
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  // Segment-boundary match: a plain startsWith(folder) makes folder "01" also
+  // match "012 Notes/…". Match the empty folder (root), the folder itself, or
+  // paths strictly under folder+"/". (Trailing "/" is trimmed so both
+  // "Notes" and "Notes/" behave identically.)
+  // rootOnly: paths with no "/" — root-level entries only (files folder="/").
+  const f = JSON.stringify(folder.replace(/\/+$/, ""));
+  const match = rootOnly ? "!p.path.includes('/')" : `!${f}||p.path===${f}||p.path.startsWith(${f}+'/')`;
+  args.push("eval", `code=app.vault.getFiles().filter(p=>${match}).map(p=>p.path).sort().join('\\n')`);
+  const out = exec(args, false, timeoutMs).stdout.trim();
+  return out || "No files found.";
+}
+
+function createTaskInNote(notePath: string, heading: string, taskText: string, vault?: string, timeoutMs = 30_000): string {
+  const j = JSON.stringify;
+  const script = [
+    `const f=app.vault.getAbstractFileByPath(${j(notePath)});`,
+    `if(!f)return'File not found.';`,
+    `let c=await app.vault.adapter.read(f.path);`,
+    `const ls=c.split('\\n');`,
+    `let hi=-1;`,
+    `for(let i=0;i<ls.length;i++){const t=ls[i].trim();if(t.startsWith('#')&&t.replace(/^#+\\s*/,'')===${j(heading)}){hi=i;break;}}`,
+    `if(hi<0){await app.vault.adapter.write(f.path,c+'\\n## '+${j(heading)}+'\\n- [ ] '+${j(taskText)}+'\\n');return'Created heading and task.';}`,
+    `const hlm=ls[hi].match(/^(#+)\\s*/);const hl=hlm?hlm[1].length:1;`,
+    `let se=ls.length;`,
+    `for(let i=hi+1;i<ls.length;i++){const m=ls[i].match(/^(#+)\\s*/);if(m&&m[1].length<=hl){se=i;break;}}`,
+    `ls.splice(se,0,'- [ ] '+${j(taskText)});`,
+    `await app.vault.adapter.write(f.path,ls.join('\\n'));`,
+    `return'Task added.';`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _out301 = execObsidian(args, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+  if (!_out301 || /^Error[:\s]/.test(_out301)) throw new Error(`createTaskInNote failed for "${notePath}": ${_out301 || "(no output)"}`);
+  return _out301;
+}
+
+function createFromTemplate(templateName: string, noteName: string, folder: string, fill: Record<string, string>, vault?: string, timeoutMs = 30_000): string {
+  const j = JSON.stringify;
+  if (!noteName.includes(".")) noteName += ".md";
+  const notePath = folder ? `${folder}/${noteName}` : noteName;
+  // ponytail: normalize template name, fallback to name-based search
+  const tplName = templateName.endsWith(".md") ? templateName : templateName + ".md";
+  const script = [
+    `const nameToFind=${j(tplName)};`,
+    `let tf=app.vault.getAbstractFileByPath(nameToFind);`,
+    `if(!tf){`,
+    `const all=app.vault.getMarkdownFiles();`,
+    `const matches=all.filter(f=>f.name.toLowerCase()===nameToFind.toLowerCase());`,
+    `if(matches.length===1)tf=matches[0];`,
+    `else if(matches.length>1)return'Multiple templates match \"'+nameToFind+'\". Use full path.';`,
+    `}`,
+    `if(!tf)return'Template not found: '+nameToFind;`,
+    `let c=await app.vault.adapter.read(tf.path);`,
+    `const fl=${JSON.stringify(fill)};`,
+    `for(const[k,v]of Object.entries(fl))c=c.replace(new RegExp('\\\\{\\\\{\\\\s*'+k.replace(/[.*+?^\${}()|[\\]\\\\]/g,'\\\\$&')+'\\\\s*\\\\}\\\\}','g'),v);`,
+    `c=c.replace(/\\{\\{date:([^}]+)\\}\\}/g,(_,f)=>{const d=new Date();return f.replace(/YYYY/g,d.getFullYear()).replace(/MM/g,('0'+(d.getMonth()+1)).slice(-2)).replace(/DD/g,('0'+d.getDate()).slice(-2)).replace(/HH/g,('0'+d.getHours()).slice(-2)).replace(/mm/g,('0'+d.getMinutes()).slice(-2));});`,
+    `${prepare(notePath)}`,
+    `await app.vault.adapter.write(${j(notePath)}.replace(/\\\\/g,'/'),c);`,
+    `return'Created.';`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _res332 = execObsidian(args, false, timeoutMs);
+  const _out332 = _res332.stdout.trim().replace(/^=>\s?/, "");
+  const _stderr332 = (_res332.stderr || "").trim();
+  // Friendly outcomes (template not found / multiple matches) are returned as-is.
+  if (/^(Template not found|Multiple templates match)/.test(_out332)) return _out332;
+  if (/^Error[:\s]/.test(_out332) || _stderr332) {
+    throw new Error(`createFromTemplate failed for "${notePath}": ${_out332 || "(no output)"}${_stderr332 ? `\n  Stderr: ${_stderr332.slice(0, 500)}` : ""}`);
+  }
+  // Obsidian 1.13.x can drop the eval echo on a successful new-file write
+  // (same race as vaultWrite). Empty echo → confirm the file exists via a
+  // read-back check before reporting success.
+  if (!_out332) {
+    const verArgs: string[] = [];
+    if (vault) verArgs.push(`vault=${vault}`);
+    verArgs.push("eval", `code=${wrapEval(`const t=${j(notePath)};const f=app.vault.getAbstractFileByPath(t);return f?'ok':'not found'`)}`);
+    const verOut = execObsidian(verArgs, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+    if (!/^ok$/.test(verOut)) throw new Error(`createFromTemplate verification failed for "${notePath}": ${verOut || "(no output)"}`);
+  }
+  return "Created.";
+}
+
+function propertyRename(from: string, to: string, filePath?: string, vault?: string, timeoutMs = 30_000): string {
+  const j = JSON.stringify;
+  const scopeFilter = filePath
+    ? [`const files=[app.vault.getAbstractFileByPath(${j(filePath)})].filter(Boolean);`]
+    : [`const files=app.vault.getMarkdownFiles();`];
+  const script = [
+    ...scopeFilter,
+    `const ff=${j(from)},tt=${j(to)};`,
+    `let u=0,s=0;`,
+    `for(const f of files){`,
+    `let c=await app.vault.adapter.read(f.path);`,
+    `let m=c.match(/^---\\s*\\n([\\s\\S]*?)\\n---/);`,
+    `if(!m){s++;continue;}`,
+    `let fm=m[1];`,
+    `let nfm=fm.split('\\n').map(l=>l.startsWith(ff+':')?tt+l.slice(ff.length):l).join('\\n');`,
+    `if(nfm===fm){s++;continue;}`,
+    `c='---\\n'+nfm+'\\n---'+c.slice(m[0].length);`,
+    `await app.vault.adapter.write(f.path,c);u++;}`,
+    `const scopeMsg=${j(filePath ? `Renamed in "${filePath}".` : "Global rename across all files. Use `file=...` to scope to one file.")};`,
+    `return scopeMsg+' '+u+' properties renamed ('+s+' skipped).';`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _out359 = execObsidian(args, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+  if (!_out359 || /^Error[:\s]/.test(_out359)) throw new Error(`propertyRename failed: ${_out359 || "(no output)"}`);
+  return _out359;
+}
+
+export function renameTag(
+  from: string,
+  to: string,
+  preview: boolean,
+  vault?: string,
+  timeoutMs = 30_000,
+  exec: (args: string[], formatJson?: boolean, timeoutMs?: number) => { stdout: string; stderr: string; parsed: unknown } = execObsidian
+): string {
+  if (!from) throw new Error("'from=' is required for tag-rename.");
+  // \b never matches against a non-word edge char: with from="#moc" a leading
+  // \b fails whenever the tag follows whitespace. Degrade to \B at any pattern
+  // edge that is a non-word char, so "  - #moc" matches but "x#moc" doesn't.
+  const ef = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const lead = /^\w/.test(from) ? "\\b" : "\\B";
+  const trail = /\w$/.test(from) ? "\\b" : "\\B";
+  const script = [
+    `const ff=${JSON.stringify(from)},tt=${JSON.stringify(to)};`,
+    `const tagRe=new RegExp(${JSON.stringify(lead + ef + trail)},'g');`,
+    `const preview=${preview ? "true" : "false"};`,
+    `let u=0,s=0;`,
+    `const results=[];`,
+    `for(const f of app.vault.getMarkdownFiles()){`,
+    `let c=await app.vault.adapter.read(f.path);`,
+    `const o=c;`,
+    `let m=c.match(/^---\\s*\\n([\\s\\S]*?)\\n---/);`,
+    `if(!m){s++;continue;}`,
+    `let fm=m[1];`,
+    // Function replacement: a string tt would expand $&/$1 sequences in `to`.
+    `let nfm=fm.replace(/\\btags\\b[^]*?(?=\\n---|$)/g,(tl)=>tl.replace(tagRe,()=>tt));`,
+    `if(nfm===fm){s++;continue;}`,
+    `if(preview){`,
+    `results.push('[DRY-RUN] '+f.path+': would update tag '+ff+' -> '+tt);`,
+    `}else{`,
+    `c='---\\n'+nfm+'\\n---'+c.slice(m[0].length);`,
+    `await app.vault.adapter.write(f.path,c);`,
+    `results.push(f.path);`,
+    `}`,
+    `u++;}`,
+    `const header=preview?'tag-rename dry-run: ':'tag-rename: ';`,
+    `return header+u+' updated, '+s+' skipped.\\n'+results.join('\\n');`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _out390 = exec(args, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+  if (!_out390 || /^Error[:\s]/.test(_out390)) throw new Error(`renameTag failed: ${_out390 || "(no output)"}`);
+  return _out390;
+}
+
+export function searchReplace(
+  query: string,
+  replace: string,
+  flags: { regex?: boolean; preview?: boolean },
+  vault?: string,
+  timeoutMs = 30_000,
+  exec: (args: string[], formatJson?: boolean, timeoutMs?: number) => { stdout: string; stderr: string; parsed: unknown } = execObsidian
+): string {
+  const j = JSON.stringify;
+  const useRegex = flags.regex ?? false;
+  const preview = flags.preview ?? false;
+  const script = [
+    `const q=${j(query)},r=${j(replace)};`,
+    `const useRegex=${useRegex};`,
+    `const preview=${preview};`,
+    `let results=[];`,
+    `for(const f of app.vault.getMarkdownFiles()){`,
+    `let c=await app.vault.adapter.read(f.path);`,
+    `let nc=c;`,
+    `let idx=-1,mlen=0;`,
+    `if(useRegex){`,
+    `try{const re=new RegExp(q,'g');const m=re.exec(c);if(m){idx=m.index;mlen=m[0].length;}nc=c.replace(re,r);}`,
+    `catch(e){results.push(f.path+': regex error: '+e.message);continue;}`,
+    `}else{`,
+    `idx=c.indexOf(q);mlen=q.length;`,
+    `nc=c.split(q).join(r);`,
+    `}`,
+    `if(nc!==c){`,
+    `if(preview){`,
+    `const start=Math.max(0,idx-40);`,
+    `const end=Math.min(c.length,idx+mlen+40);`,
+    `results.push(f.path+': '+JSON.stringify(c.slice(start,end)));`,
+    `}else{`,
+    `await app.vault.adapter.write(f.path,nc);`,
+    `results.push(f.path);`,
+    `}`,
+    `}`,
+    `}`,
+    `return results.length+' file(s):\\n'+results.join('\\n');`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _out434 = exec(args, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+  if (!_out434 || /^Error[:\s]/.test(_out434)) throw new Error(`searchReplace failed: ${_out434 || "(no output)"}`);
+  return _out434;
+}
+
+export function filesMissingProperty(
+  property: string,
+  vault?: string,
+  timeoutMs = 30_000,
+  exec: (args: string[], formatJson?: boolean, timeoutMs?: number) => { stdout: string; stderr: string; parsed: unknown } = execObsidian
+): string {
+  const script = [
+    `const prop=${JSON.stringify(property)};`,
+    `const missing=[];`,
+    `for(const f of app.vault.getMarkdownFiles()){`,
+    `let c=await app.vault.read(f);`,
+    `let m=c.match(/^---\\s*\\n([\\s\\S]*?)\\n---/);`,
+    `if(!m){missing.push(f.path+' (no frontmatter)');continue;}`,
+    `if(!m[1].includes(prop+':'))missing.push(f.path);`,
+    `}`,
+    `if(missing.length===0)return 'All files have "'+prop+'".';`,
+    `return missing.length+' file(s) missing "'+prop+'":\\n'+missing.join('\\n');`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _out453 = exec(args, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+  if (!_out453 || /^Error[:\s]/.test(_out453)) throw new Error(`filesMissingProperty failed: ${_out453 || "(no output)"}`);
+  return _out453;
+}
+
+function frontmatterWrap(vault?: string, timeoutMs = 30_000): string {
+  const script = [
+    `let u=0,s=0;`,
+    `for(const f of app.vault.getMarkdownFiles()){`,
+    `let c=await app.vault.adapter.read(f.path);`,
+    `if(c.match(/^---\\s*\\n/)){s++;continue;}`,
+    `const lines=c.split('\\n');`,
+    `let firstRealLine=-1;`,
+    `for(let i=0;i<lines.length;i++){if(lines[i].trim()){firstRealLine=i;break;}}`,
+    `if(firstRealLine<0){s++;continue;}`,
+    `const fl=lines[firstRealLine].trim();`,
+    `if(!fl.startsWith('title:')&&!fl.startsWith('tags:')){s++;continue;}`,
+    `let fmEnd=lines.length;`,
+    `let afterFirst=false;`,
+    `for(let i=firstRealLine+1;i<lines.length;i++){`,
+    `const t=lines[i].trim();`,
+    `if(t.startsWith('#')||t.startsWith('---')){fmEnd=i;break;}`,
+    `if(afterFirst&&!t){fmEnd=i;break;}`,
+    `if(t)afterFirst=true;`,
+    `}`,
+    `const fm=lines.slice(firstRealLine,fmEnd).join('\\n');`,
+    `const body=lines.slice(fmEnd).join('\\n');`,
+    `await app.vault.adapter.write(f.path,'---\\n'+fm+'\\n---\\n'+body);u++;`,
+    `}`,
+    `return u+' files wrapped ('+s+' skipped).';`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _out485 = execObsidian(args, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+  if (!_out485 || /^Error[:\s]/.test(_out485)) throw new Error(`frontmatterWrap failed: ${_out485 || "(no output)"}`);
+  return _out485;
+}
+
+// ---------------------------------------------------------------------------
+// Frontmatter validation — files validate-tags
+// ---------------------------------------------------------------------------
+
+export function validateTags(requiredDims: string[], vault?: string, timeoutMs = 30_000): string {
+  const j = JSON.stringify;
+  const script = [
+    `const req=${j(requiredDims)};`,
+    `const issues=[];`,
+    `for(const f of app.vault.getMarkdownFiles()){`,
+    `  let cache=app.metadataCache.getFileCache(f);`,
+    `  let tags=cache?.frontmatter?.tags;`,
+    `  let raw=await app.vault.adapter.read(f.path);`,
+    `  let m=raw.match(/^---\\s*\\n([\\s\\S]*?)\\n---/);`,
+    `  if(!tags&&m){`,
+    `    let rawTags=m[1].match(/#[a-zA-Z][a-zA-Z0-9_\/-]+/g);`,
+    `    tags=rawTags||[];`,
+    `  }`,
+    `  let rawHasHash=m&&req.some(function(d){return m[1].indexOf('#'+d)>=0});`,
+    `  let parsedTags=Array.isArray(tags)?tags:(tags?[tags]:[]);`,
+    `  if(parsedTags.length===0){issues.push(f.path+' — no tags found');continue;}`,
+    `  for(const dim of req){`,
+    `    if(!parsedTags.some((t)=>typeof t==='string'&&(t.startsWith(dim)||t.replace(/^#/,'').startsWith(dim)))){`,
+    `      issues.push(f.path+' — missing #'+dim+'*');`,
+    `      break;`,
+    `    }`,
+    `  }`,
+    `}`,
+    `if(issues.length===0)return 'All files have valid tags.';`,
+    `return issues.length+' file(s) with tag issues:\\n'+issues.join('\\n');`,
+  ].join("");
+  const args: string[] = [];
+  if (vault) args.push(`vault=${vault}`);
+  args.push("eval", `code=${wrapEval(script)}`);
+  const _out = execObsidian(args, false, timeoutMs).stdout.trim().replace(/^=>\s?/, "");
+  if (!_out || /^Error[:\s]/.test(_out)) throw new Error(`validateTags failed: ${_out || "(no output)"}`);
+  return _out;
+}
+
+// ---------------------------------------------------------------------------
+// Route JSON output to formatters
+// ---------------------------------------------------------------------------
+
+function formatObsidianOutput(cmdString: string, parsed: unknown): string {
+  const cmd = cmdString.split(/\s+/)[0];
+  const flags = parseFlags(cmdString);
+  switch (cmd) {
+    case "search":
+      return formatSearchResults(parsed, flags.group === "file");
+    case "tasks":
+      if (flags.status && !["open", "done", "all"].includes(flags.status)) {
+        return `Invalid status "${flags.status}". Use open, done, or all.`;
+      }
+      if (flags.group === "file" && flags.status) return formatTasksFiltered(parsed, flags.status as "open" | "done" | "all");
+      if (flags.group === "file") return formatTasks(parsed, true);
+      if (flags.status) return formatTasksFiltered(parsed, flags.status as "open" | "done" | "all");
+      return formatTasks(parsed);
+    case "tag":
+    case "tags":
+      return formatTags(parsed);
+    case "properties":
+      return formatProperties(parsed);
+    case "backlinks":
+      return formatLinks(parsed, "Backlinks");
+    case "links":
+      return formatOutgoingLinks(parsed);
+    case "outline":
+      return formatOutline(parsed);
+    case "aliases":
+      return formatAliases(parsed);
+    case "wordcount":
+      return formatWordCount(parsed);
+    case "file":
+      return formatFileInfo(parsed);
+    default:
+      return JSON.stringify(parsed, null, 2);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool wrapper
+// ---------------------------------------------------------------------------
+
+function tool(body: (p: Record<string, unknown>, ctx: { cwd?: string }) => string) {
+  return async function execute(_id: string, params: Record<string, unknown>, _signal: unknown, _onUpdate: unknown, ctx: { cwd?: string }) {
+    const text = body(params, ctx ?? {});
+    return { content: [{ type: "text" as const, text }], details: {} };
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Extension entry point
+// ---------------------------------------------------------------------------
+
+export default function piObsidianExtension(pi: ExtensionAPI) {
+  // Deferred tier: the obsidian tool register `exposure: "deferred"`
+  // — discovered via tool_search. Pi only auto-activates tool_search for MCP
+  // servers, so this package owns its activation (ceulen's pattern).
+  pi.on("session_start", async () => {
+    if (!pi.getAllTools().some((t) => t.name === "tool_search")) return;
+    const active = pi.getActiveTools();
+    if (!active.includes("tool_search")) pi.setActiveTools([...active, "tool_search"]);
+  });
+
+
+
+  pi.on("tool_call", (event, ctx) => {
+    const cwdVault = obsidianVaultRoot(ctx.cwd);
+    const input = event.input as Record<string, unknown>;
+
+    if (cwdVault) {
+      // CWD is inside an Obsidian vault — existing guard logic
+      const path = typeof input.path === "string" ? input.path : undefined;
+      const targetsVault = isPathInObsidianVault(path, ctx.cwd, cwdVault);
+      if ((["read", "write", "edit", "ls", "find", "grep"].includes(event.toolName) && (targetsVault || (["ls", "find", "grep"].includes(event.toolName) && !path)))
+        || (event.toolName === "bash" && isVaultFilesystemBashCommand(input.command, ctx.cwd, cwdVault))) {
+        return {
+          block: true,
+          reason: `Obsidian vault detected at ${cwdVault}. Use the obsidian tool instead — e.g. obsidian run="read file=\\"My Note\\"" (pass vault="<name>" if not the focused vault). Use explicit external paths for non-vault work.`,
+        };
+      }
+      return;
+    }
+
+    // CWD is NOT in a vault — check if targets hit a known vault
+    const roots = allVaultRoots();
+    if (roots.length === 0) return;
+
+    if (event.toolName === "bash" && typeof input.command === "string") {
+      for (const root of roots) {
+        if (isVaultFilesystemBashCommand(input.command, ctx.cwd, root)) {
+          // Ponytail: isVaultFilesystemBashCommand is over-aggressive for && chains.
+          // Cross-vault guard requires an actual vault path reference in the command.
+          // commandMentionsVaultPath resolves `..`-relative paths against cwd
+          // before matching the root/.obsidian literals, so `rm ../MyVault/x.md`
+          // is caught (nightly 2026-09-29 P1). Normalizes separators and (on
+          // Windows) case so `rm D:/MyVault/x.md` matches the CLI-printed
+          // `D:\MyVault` root (#4).
+          const containsVaultPath = commandMentionsVaultPath(input.command, ctx.cwd, root);
+          if (!containsVaultPath) continue;
+          return {
+            block: true,
+            reason: `Command targets Obsidian vault at ${root}. Use the obsidian tool instead — e.g. obsidian run="read file=\\"My Note\\"" (pass vault="<name>" if not the focused vault).`,
+          };
+        }
+      }
+      return;
+    }
+    if (["read", "write", "edit", "ls", "find", "grep"].includes(event.toolName)) {
+      const targetPath = typeof input.path === "string" ? input.path : undefined;
+      if (targetPath) {
+        for (const root of roots) {
+          if (isPathInObsidianVault(targetPath, ctx.cwd, root)) {
+            return {
+              block: true,
+              reason: `Path targets Obsidian vault at ${root}. Use the obsidian tool instead — e.g. obsidian run="read file=\\"My Note\\"" (pass vault="<name>" if not the focused vault).`,
+            };
+          }
+        }
+      } else if (["ls", "find", "grep"].includes(event.toolName) && ctx.cwd) {
+        // No explicit path — check if CWD is an ancestor of any known vault root
+        // (e.g. CWD=/home/user, vault=/home/user/vault — then ls/find/grep would recurse into vault)
+        const cwdAbs = resolve(ctx.cwd);
+        for (const root of roots) {
+          const rel = relative(cwdAbs, root);
+          // Vault root is inside CWD if relative path doesn't start with ".."
+          if (rel && !rel.startsWith(".." + sep) && !isAbsolute(rel)) {
+            return {
+              block: true,
+              reason: `CWD is a parent directory of vault at ${root}. Use the obsidian tool instead — e.g. obsidian run="read file=\\"My Note\\"" (pass vault="<name>" if not the focused vault).`,
+            };
+          }
+        }
+      }
+    }
+  });
+
+  pi.registerTool({
+    name: "obsidian",
+    exposure: "deferred" as const,
+    label: "Run Obsidian CLI Command",
+    description: "Run an Obsidian CLI command on the vault. Commands: read, write, create, append, prepend, delete, move, rename, search, files, tasks, task-create, tags, tag-rename, properties, property:set, property:rename, backlinks, outline, links, history, diff, vault, templates, create-from-template, frontmatter:wrap, bookmarks, plugins, daily:read/append/prepend, eval.",
+    promptSnippet: "Run an Obsidian CLI command on the vault",
+    promptGuidelines: [
+      "Use obsidian—not bash, read, write, edit, ls, find, or grep—for every operation on files in an Obsidian vault; pass vault=<name> if it is not the focused vault.",
+      "Format: `<command> <key=value> ... <flag>`",
+      "Quote spaces: `file=\"My Note\"`, content=`# Title`.",
+      "content_from=SourceNoteName to clone an existing note's content.",
+      "eval file=ScriptNoteName for JS from vault note.",
+      "format=json for structured output (search, tasks, tags).",
+      "Boolean flags: permanent, overwrite, total, verbose, inline, silent.",
+      "file= for wikilinks, path= for exact paths.",
+      "Commands: read, create, write, append, prepend, delete, move, rename,",
+      "  search, tags, tag-rename, property:set, property:rename, properties,",
+      "  tasks, task-create, create-from-template,",
+      "  backlinks, outline, links, daily:*,",
+      "  vault, files, history, diff, templates, eval, bookmarks, plugins,",
+      "  frontmatter:wrap.",
+      "move: `destination=<path>` accepted as alias for `to=<path>`.",
+      "Search with replace: `search query=text replace=new regex=true preview=true`",
+      "Files by missing property: `files missing-property=created`",
+      "Property rename: `property:rename from=date to=created`",
+      "Frontmatter wrap: `frontmatter:wrap`",
+      "property:set for lists (tags, aliases): name=tags type=list value=\"#tag1,#tag2\" file=Note",
+      "search --replace uses preview=true for dry-run; omit to apply.",
+    ],
+    parameters: Type.Object({
+      run: Type.String({
+        description: "Full Obsidian CLI command via \`run\` param."
+      }),
+      vault: Type.Optional(Type.String({ description: "Target vault. Default: most recent." })),
+      timeout_ms: Type.Optional(Type.Number({ description: "Timeout ms (default 30000)." })),
+    }),
+    execute: tool((p, ctx) => {
+      let raw = (p.run as string).trim();
+      if (!raw) throw new Error("'run' is required.");
+      const cmd = raw.split(/\s+/)[0];
+      if (cmd.startsWith("daily:") && !["daily:read", "daily:append", "daily:prepend"].includes(cmd)) {
+        throw new Error(`Command "${cmd}" is only available via the Obsidian desktop app and is not supported in CLI mode.`);
+      }
+      const flags = parseFlags(raw);
+      // ponytail: validate property:set args before vault auto-detection (which shells out)
+      if (cmd === "property:set" && !flags.name && flags.key) {
+        throw new Error("'name=' is required (not 'key='). Example: property:set name=status value=active file=Note");
+      }
+      // Data-loss guard (issue #21), before vault auto-detection (which shells
+      // out): a write/create/overwrite with no content source, or carrying
+      // params that belong to the search command, is a caller mistake — error
+      // instead of silently clobbering the file with "".
+      if (cmd === "create" || cmd === "write" || cmd === "overwrite") {
+        const foreignParams = ["search", "replace", "regex", "preview"].filter((k) => k in flags);
+        if (foreignParams.length > 0 && flags.content === undefined) {
+          throw new Error(
+            `"${cmd}" does not take ${foreignParams.map((k) => k + "=").join("/")} — those belong to the search command. ` +
+            `This looks like a search/replace call. Use search/replace on the search command, or pass content= explicitly.`
+          );
+        }
+        if (flags.content === undefined && !flags.content_from) {
+          throw new Error(
+            `"${cmd}" with no content=/content_from= would write an empty file. ` +
+            `Pass content= (the full new file content), or use search+replace to edit in place.`
+          );
+        }
+      }
+      const explicitVault = (p.vault as string | undefined) ?? flags.vault;
+      const v = explicitVault ?? focusedVaultNameForCwd(ctx.cwd);
+      if (!v && isObsidianVaultCwd(ctx.cwd)) {
+        throw new Error("This cwd is an Obsidian vault but it is not the focused vault. Supply vault=\"<vault name>\" to avoid operating on another vault.");
+      }
+      const cliArgs = () => parseCliString(raw).filter((arg) => !arg.startsWith("vault="));
+      const rawTimeoutMs = (p.timeout_ms as number) ?? (flags.timeout_ms ? parseInt(flags.timeout_ms) : 30_000);
+      // Non-finite (NaN from a bad param or parseInt) would throw ERR_OUT_OF_RANGE inside spawnSync.
+      const timeoutMs = Number.isFinite(rawTimeoutMs) ? rawTimeoutMs : 30_000;
+
+      // --- files: recursive, root, normal, missing-property, validate-tags ---
+      if (cmd === "files") {
+        if (flags["validate-tags"] || parseCliString(raw).includes("validate-tags")) {
+          const dims = !flags["validate-tags"] || flags["validate-tags"] === "true"
+            ? ["type/", "domain/"]
+            : flags["validate-tags"].split(",").map((s: string) => s.trim());
+          return validateTags(dims, v, timeoutMs);
+        }
+        if (flags["missing-property"]) {
+          return filesMissingProperty(flags["missing-property"], v, timeoutMs);
+        }
+        const folder = flags.folder ?? "";
+        const isRoot = folder === "/" || folder === "";
+        const explicitRecursive = parseCliString(raw).includes("recursive");
+        if (isRoot || explicitRecursive) {
+          // Root without an explicit `recursive` token lists only root-level
+          // entries (no "/") — the full vault dump was a bug (issue: README
+          // promises "Root-level files"). Explicit `recursive` keeps the full
+          // listing. parseCliString token match avoids substring false-
+          // positives (same guard as validate-tags).
+          return listFilesRecursive(isRoot ? "" : folder, v, timeoutMs, execObsidian, isRoot && !explicitRecursive);
+        }
+        const args: string[] = [];
+        if (v) args.push(`vault=${v}`);
+        args.push("files", `folder=${folder}`, "format=json");
+        try {
+          const r = execObsidian(args, false, timeoutMs);
+          if (typeof r.parsed === "string" && r.parsed.trim()) {
+            const files = r.parsed.trim().split("\n").filter(Boolean).sort();
+            if (files.length > 0) return files.join("\n");
+          }
+          if (r.parsed && Array.isArray(r.parsed) && r.parsed.length > 0) return (r.parsed as string[]).sort().join("\n");
+        } catch (e) {
+          // Real CLI failure must not masquerade as an empty vault — say so.
+          return `Obsidian CLI error: ${e instanceof Error ? e.message : String(e)}`;
+        }
+        return "No files found.";
+      }
+
+      // --- enhanced note operations ---
+      if (cmd === "task-create") {
+        if ((!flags.path && !flags.file) || !flags.heading || !flags.text) throw new Error("'path' (or 'file'), 'heading' and 'text' required.");
+        const notePath = flags.path || flags.file;
+        return createTaskInNote(notePath, flags.heading, flags.text, v, timeoutMs);
+      }
+      if (cmd === "create-from-template") {
+        if (!flags.template || !flags.name) throw new Error("'template' and 'name' required.");
+        const fill = Object.fromEntries(Object.entries(flags).filter(([key]) => !["template", "name", "folder"].includes(key)));
+        return createFromTemplate(flags.template, flags.name, flags.folder ?? "", fill, v, timeoutMs);
+      }
+
+      // --- tag-rename (B4: preview support added) ---
+      if (cmd === "tag-rename") {
+        if (!flags.from || !flags.to) throw new Error("'from' and 'to' required.");
+        const preview = flags.preview === "true" || flags.preview === "1";
+        return renameTag(flags.from, flags.to, preview, v, timeoutMs);
+      }
+
+      // --- property:rename (B5: optional file/path scoping added) ---
+      if (cmd === "property:rename") {
+        if (!flags.from || !flags.to) throw new Error("'from' and 'to' required.");
+        const filePath = flags.file || flags.path || undefined;
+        return propertyRename(flags.from, flags.to, filePath, v, timeoutMs);
+      }
+
+      // --- search with replace ---
+      if (cmd === "search" && flags.replace) {
+        const regex = flags.regex === "true" || flags.regex === "1";
+        const preview = flags.preview === "true" || flags.preview === "1";
+        return searchReplace(flags.query || "", flags.replace, { regex, preview }, v, timeoutMs);
+      }
+
+      // --- search with empty query → match everything ---
+      if (cmd === "search" && !flags.query) {
+        const folder = flags.path || flags.folder || "";
+        if (folder) {
+          const sArgs: string[] = [];
+          if (v) sArgs.push(`vault=${v}`);
+          sArgs.push("files", `folder=${folder}`, "format=json");
+          const r = execObsidian(sArgs, false, timeoutMs);
+          if (r.parsed && typeof r.parsed !== "string") return formatObsidianOutput(raw, r.parsed);
+          return r.stdout.trim() || "No files found.";
+        }
+        return listFilesRecursive("", v, timeoutMs);
+      }
+
+      // --- frontmatter:wrap ---
+      if (cmd === "frontmatter:wrap") {
+        return frontmatterWrap(v, timeoutMs);
+      }
+
+      // --- eval: inline or from note (B7: auto-add return for bare expressions) ---
+      if (cmd === "eval") {
+        let code = flags.code || "";
+        if (flags.file) {
+          const rArgs: string[] = [];
+          if (v) rArgs.push(`vault=${v}`);
+          rArgs.push("read", `path=${flags.file}`);
+          code = execObsidian(rArgs, false, timeoutMs).stdout;
+        }
+        if (!code) throw new Error("'code=' or 'file=' required.");
+        // ponytail: auto-add return for simple bare expressions
+        const trimmed = code.trim();
+        // If the caller already supplied a complete async IIFE (with its own
+        // try/catch), pass it through as-is — wrapping it again would discard
+        // its return value (inner IIFE result lost → empty echo).
+        const alreadyWrapped =
+          /^\(async\s+function/.test(trimmed) || /^\(async\s*\(/.test(trimmed) || /^\(async\s*\w*\s*=>/.test(trimmed);
+        if (
+          !alreadyWrapped &&
+          !trimmed.startsWith("return ") &&
+          !trimmed.startsWith("if") &&
+          !trimmed.startsWith("for") &&
+          !trimmed.startsWith("while") &&
+          !trimmed.startsWith("{") &&
+          !trimmed.startsWith("const ") &&
+          !trimmed.startsWith("let ") &&
+          !trimmed.startsWith("var ") &&
+          !trimmed.startsWith("async") &&
+          !trimmed.startsWith("function") &&
+          !trimmed.startsWith("try") &&
+          !trimmed.startsWith("switch") &&
+          code.length < 200 &&
+          !code.includes(";")
+        ) {
+          code = "return " + trimmed;
+        }
+        const eArgs: string[] = [];
+        if (v) eArgs.push(`vault=${v}`);
+        eArgs.push("eval", `code=${alreadyWrapped ? code : `(async function(){try{${code}}catch(e){return 'Error: '+String(e&&e.message||e)}})()`}`);
+        const _evalRes = execObsidian(eArgs, false, timeoutMs);
+        let evalOut = _evalRes.stdout.trim().replace(/^=>\s?/, "");
+        let evalStderr = (_evalRes.stderr || "").trim();
+        // Obsidian 1.13.x intermittently drops the eval echo on scripts whose
+        // async body does real I/O — the side effect usually landed. Retry
+        // once ONLY for read-only scripts (a retry cannot double-apply a
+        // read); write-capable scripts are never re-executed — a lost echo
+        // there most likely means the write DID apply, so report it as a
+        // warning instead of an error that would deny successful work.
+        const writeCapable = /adapter\.(write|remove|append)|vault\.(create|modify|trash|process|rename|delete)|createFolder|navigator\.clipboard/.test(code);
+        if (!evalOut && !evalStderr) {
+          if (!writeCapable) {
+            const retryRes = execObsidian(eArgs, false, timeoutMs);
+            evalOut = retryRes.stdout.trim().replace(/^=>\s?/, "");
+            evalStderr = (retryRes.stderr || "").trim();
+          }
+          if (!evalOut && !evalStderr) {
+            return writeCapable
+              ? "(eval echo was dropped by Obsidian 1.13.x; the script's side effects most likely applied — verify the result before re-running)"
+              : "(eval returned no result; side effects none — read-only script)";
+          }
+        }
+        if (/^Error[:\s]/.test(evalOut)) throw new Error(`eval returned error: ${evalOut}`);
+        return evalOut;
+      }
+
+      // --- create/write/overwrite: route through vaultWrite (base64+eval) ---
+      if (cmd === "create" || cmd === "write" || cmd === "overwrite") {
+        const path = flags.path || flags.file || "";
+        if (!path) throw new Error("'path=' (or 'file=') is required for create/write/overwrite.");
+        let content = flags.content ?? "";
+        if (flags.content_from) {
+          const rArgs: string[] = [];
+          if (v) rArgs.push(`vault=${v}`);
+          rArgs.push("read", `path=${flags.content_from}`);
+          content = execObsidian(rArgs, false, timeoutMs).stdout;
+        }
+        // Content-presence guard lives in the early validation block (issue #21).
+        const overwrite = cmd !== "create" || parseCliString(raw).includes("overwrite=true");
+        return vaultWrite(path, content, overwrite ? "overwrite" : "create", v, timeoutMs);
+      }
+
+      // --- append/prepend with content: route through vaultWrite (base64+eval) ---
+      if ((cmd === "append" || cmd === "prepend") && flags.content !== undefined) {
+        const path = flags.path || flags.file || "";
+        if (!path) throw new Error(`'path=' (or 'file=') is required for ${cmd}.`);
+        return vaultWrite(path, flags.content, cmd, v, timeoutMs);
+      }
+
+      // --- property:set with array values ---
+      if (cmd === "property:set") {
+        const args = cliArgs();
+        // Auto-add type=list for tags property if not already specified
+        const ni = args.findIndex(a => a.startsWith("name="));
+        const isTags = ni >= 0 && args[ni].slice(5) === "tags";
+        if (isTags && !args.some(a => a.startsWith("type="))) {
+          args.splice(ni + 1, 0, "type=list");
+        }
+        const ai = args.findIndex(a => a.startsWith("value="));
+        if (ai >= 0) {
+          let end = ai + 1;
+          while (end < args.length && !/^\w[\w-]*=/.test(args[end])) end++;
+          const value = [args[ai].slice(6), ...args.slice(ai + 1, end)].join(" ");
+          if (value.startsWith("[") && value.endsWith("]")) {
+            const fixed = [...args.slice(0, ai), ...args.slice(end)];
+            const ti = fixed.findIndex(a => a.startsWith("type="));
+            if (ti >= 0) fixed.splice(ti, 1);
+            fixed.splice(ai, 0, "type=list", `value=${value.slice(1, -1)}`);
+            if (v) fixed.unshift(`vault=${v}`);
+            const r = execObsidian(fixed, false, timeoutMs);
+            return r.stdout.trim() || `Command "property:set" produced no output.`;
+          }
+        }
+        // Execute with the modified args (auto-injected type=list survives here)
+        // Ponytail: normalise args for the Obsidian CLI, same as the standard passthrough below
+        if (v) args.unshift(`vault=${v}`);
+        const r = execObsidian(args, false, timeoutMs);
+        return r.stdout.trim() || `Command "property:set" produced no output.`;
+      }
+
+      // --- Standard CLI passthrough (B1/B6: normalize file= and bare paths) ---
+      const args = cliArgs();
+      // ponytail: normalize bare positional arg to path= for read/append/prepend
+      if (args.length >= 2 && !args[1].includes("=")) {
+        args[1] = "path=" + args[1];
+      }
+      // R2: normalize file= to path= for delete (create/write handled earlier, this is fallback)
+      for (let i = 1; i < args.length; i++) {
+        if (args[i].startsWith("file=") && args[0] === "delete") {
+          args[i] = "path=" + args[i].slice(5);
+        }
+      }
+      // B9: normalize destination= to to= for move (backward-compatible alias),
+      //     and infer file extension on to= from source filename when missing.
+      //     Obsidian CLI treats to= without extension as a folder (e.g. Dest/Src.md
+      //     instead of Dest.md), so we append the source's extension or default .md.
+      if (cmd === "move") {
+        const di = args.findIndex(a => a.startsWith("destination="));
+        if (di >= 0) args[di] = "to=" + args[di].slice(12);
+        const ti = args.findIndex(a => a.startsWith("to="));
+        const fi = args.findIndex(a => a.startsWith("file=") || a.startsWith("path="));
+        if (ti >= 0 && fi >= 0) {
+          const toVal = args[ti].slice(3);
+          const srcVal = args[fi].slice(5);
+          const toLast = toVal.split("/").pop() || "";
+          const srcLast = srcVal.split("/").pop() || "";
+          if (toLast && !toLast.includes(".")) {
+            const ext = srcLast.includes(".") ? srcLast.slice(srcLast.lastIndexOf(".")) : ".md";
+            args[ti] = "to=" + toVal + ext;
+          }
+        }
+      }
+      if (v) args.unshift(`vault=${v}`);
+      const r = execObsidian(args, false, timeoutMs);
+      if (r.parsed && typeof r.parsed !== "string") return formatObsidianOutput(raw, r.parsed);
+      const out = r.stdout.trim();
+      return out || `Command "${cmd}" produced no output.`;
+    }),
+  });
+}
