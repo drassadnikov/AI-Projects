@@ -1,93 +1,98 @@
 {
-    "defaultProvider":  "llama.cpp",
-    "defaultModel":  "qwen3.8-27b",
-    "defaultThinkingLevel":  "off",
-    "telemetry":  false,
-    "offlineMode":  true,
-    "hideThinkingBlock":  true,
-    "lastChangelogVersion":  "1.5.2",
-    "theme":  "dark",
-    "terminal":  {
-                     "showTerminalProgress":  true,
-                     "clearOnShrink":  true
-                 },
-    "packages":  [
-                     "A:\\PROJECTS\\pi-homepc",
-                     "npm:pi-hashline-edit-pro",
-                     "npm:pi-web-access",
-                     "npm:bigpowers",
-                     "npm:pi-powerline-footer",
-                     "npm:@moyai/pi-session-hoarder",
-                     "npm:@amaster.ai/pi-memory-mem0",
-                     "npm:pi-web-ui",
-                     "npm:pi-prompt-template-model",
-                     "npm:pi-lsp-extension",
-                     "npm:pi-fff",
-                     "npm:pi-lens",
-                     "npm:pi-interview",
-                     "npm:@plannotator/pi-extension",
-                     "npm:pi-code-previews",
-                     "git:github.com/IzumiSy/pi-file-tree-browser",
-                     "npm:pi-editor"
-                 ],
-    "images":  {
-                   "autoResize":  true
-               },
-    "showHardwareCursor":  true,
-    "editorPaddingX":  2,
-    "transport":  "auto",
-    "markdown":  {
-                     "mermaid":  "streaming"
-                 },
-    "compaction":  {
-                       "reserveTokens":  65536,
-                       "enabled":  true
-                   },
-    "defaultTools":  [
-                         "+codemode"
-                     ],
-    "pi-memory-mem0":  {
-                           "mode":  "embedded",
-                           "autoCapture":  false,
-                           "oss":  {
-                                       "llm":  {
-                                                   "provider":  "vllm",
-                                                   "config":  {
-                                                                  "model":  "qwen3.8-27b",
-                                                                  "baseURL":  "http://192.168.1.117:9931/v1",
-                                                                  "apiKey":  "local-bypass"
-                                                              }
-                                               },
-                                       "embedder":  {
-                                                        "provider":  "fastembed",
-                                                        "config":  {
-                                                                       "model":  "fast-multilingual-e5-large"
-                                                                   }
-                                                    }
-                                   }
-                       },
-    "doubleEscapeAction":  "tree",
-    "deviceId":  "5b2fe2b8-c119-4c15-84bb-f86bedac2a25",
-    "extensionChangelogVersions":  {
-                                       "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}":  "0.47.0",
-                                       "{\"source\":\"npm:bigpowers\",\"scope\":\"user\"}":  "2.96.1",
-                                       "{\"source\":\"npm:pi-powerline-footer\",\"scope\":\"user\"}":  "0.22.0",
-                                       "{\"source\":\"npm:pi-web-ui\",\"scope\":\"user\"}":  "0.120.0",
-                                       "{\"source\":\"npm:pi-prompt-template-model\",\"scope\":\"user\"}":  "0.12.3",
-                                       "{\"source\":\"npm:@bacnh85/pi-obsidian\",\"scope\":\"user\"}":  "0.9.0",
-                                       "{\"source\":\"npm:pi-lsp-extension\",\"scope\":\"user\"}":  "1.4.0",
-                                       "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}":  "4.4.12",
-                                       "{\"source\":\"npm:@heyhuynhgiabuu/pi-pretty\",\"scope\":\"user\"}":  "0.10.0"
-                                   },
-    "modelThinkingLevels":  {
-                                "llama.cpp/qwen3.8-27b":  "off"
-                            },
-    "cacheWarming":  "streaming",
-    "sessionShareDestination":  "auto",
-    "enableSkillCommands":  true,
-    "quietStartup":  true,
-    "enableInstallTelemetry":  false,
-    "defaultProjectTrust":  "accept",
-    "treeFilterMode":  "default",
-    "externalEditor":  "\"C:\\Users\\HOME-PC\\AppData\\Local\\Programs\\Zed i18n\\bin\\zed.exe\" --wait"
+  "defaultProvider": "llama.cpp",
+  "defaultModel": "qwen3.8-27b",
+  "defaultThinkingLevel": "off",
+  "telemetry": false,
+  "offlineMode": true,
+  "hideThinkingBlock": true,
+  "lastChangelogVersion": "1.6.0",
+  "theme": "dark",
+  "terminal": {
+    "showTerminalProgress": true,
+    "clearOnShrink": true
+  },
+  "packages": [
+    "A:\\PROJECTS\\pi-homepc",
+    "npm:pi-hashline-edit-pro",
+    "npm:pi-web-access",
+    "npm:bigpowers",
+    "npm:pi-powerline-footer",
+    "npm:@moyai/pi-session-hoarder",
+    "npm:@amaster.ai/pi-memory-mem0",
+    "npm:pi-web-ui",
+    "npm:pi-prompt-template-model",
+    "npm:pi-fff",
+    "npm:pi-lens",
+    "npm:pi-interview",
+    "npm:@plannotator/pi-extension",
+    "npm:pi-code-previews",
+    "git:github.com/IzumiSy/pi-file-tree-browser",
+    "npm:pi-editor",
+    "npm:@schovest/pi-i18n"
+  ],
+  "images": {
+    "autoResize": true
+  },
+  "showHardwareCursor": true,
+  "editorPaddingX": 2,
+  "transport": "auto",
+  "markdown": {
+    "mermaid": "streaming"
+  },
+  "compaction": {
+    "reserveTokens": 65536,
+    "enabled": true
+  },
+  "defaultTools": [
+    "+codemode"
+  ],
+  "pi-memory-mem0": {
+    "mode": "embedded",
+    "autoCapture": false,
+    "oss": {
+      "llm": {
+        "provider": "vllm",
+        "config": {
+          "model": "qwen3.8-27b",
+          "baseURL": "http://192.168.1.117:9931/v1",
+          "apiKey": "local-bypass"
+        }
+      },
+      "embedder": {
+        "provider": "fastembed",
+        "config": {
+          "model": "fast-multilingual-e5-large",
+          "embeddingDims": 1024
+        }
+      }
+    }
+  },
+  "doubleEscapeAction": "tree",
+  "deviceId": "5b2fe2b8-c119-4c15-84bb-f86bedac2a25",
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.48.0",
+    "{\"source\":\"npm:bigpowers\",\"scope\":\"user\"}": "2.96.1",
+    "{\"source\":\"npm:pi-powerline-footer\",\"scope\":\"user\"}": "0.22.0",
+    "{\"source\":\"npm:pi-web-ui\",\"scope\":\"user\"}": "0.121.3",
+    "{\"source\":\"npm:pi-prompt-template-model\",\"scope\":\"user\"}": "0.12.3",
+    "{\"source\":\"npm:@bacnh85/pi-obsidian\",\"scope\":\"user\"}": "0.9.0",
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.1",
+    "{\"source\":\"npm:@heyhuynhgiabuu/pi-pretty\",\"scope\":\"user\"}": "0.10.0"
+  },
+  "modelThinkingLevels": {
+    "llama.cpp/qwen3.8-27b": "off"
+  },
+  "cacheWarming": "idle",
+  "sessionShareDestination": "auto",
+  "enableSkillCommands": false,
+  "quietStartup": true,
+  "enableInstallTelemetry": false,
+  "defaultProjectTrust": "ask",
+  "treeFilterMode": "default",
+  "externalEditor": "\"C:\\Users\\HOME-PC\\AppData\\Local\\Programs\\Zed i18n\\bin\\zed.exe\" --wait",
+  "steeringMode": "one-at-a-time",
+  "showCacheMissNotices": false,
+  "collapseChangelog": true,
+  "fullscreenExitOutput": "transcript",
+  "httpIdleTimeoutMs": 0
 }

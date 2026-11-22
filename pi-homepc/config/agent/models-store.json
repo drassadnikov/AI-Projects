@@ -1,1 +1,6 @@
-{}
+{
+  "llama.cpp": {
+    "models": [],
+    "checkedAt": 1795356345584
+  }
+}
