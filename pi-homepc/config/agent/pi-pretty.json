@@ -1,0 +1,4 @@
+{
+  "disableTools": ["read", "grep"],
+  "enableTools": ["ls"]
+}

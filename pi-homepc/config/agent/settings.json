@@ -40,7 +40,6 @@
     "mermaid": "streaming"
   },
   "compaction": {
-    "reserveTokens": 65536,
     "enabled": true
   },
   "defaultTools": [
@@ -73,17 +72,16 @@
     "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.48.0",
     "{\"source\":\"npm:bigpowers\",\"scope\":\"user\"}": "2.96.1",
     "{\"source\":\"npm:pi-powerline-footer\",\"scope\":\"user\"}": "0.22.0",
-    "{\"source\":\"npm:pi-web-ui\",\"scope\":\"user\"}": "0.121.3",
+    "{\"source\":\"npm:pi-web-ui\",\"scope\":\"user\"}": "0.122.0",
     "{\"source\":\"npm:pi-prompt-template-model\",\"scope\":\"user\"}": "0.12.3",
     "{\"source\":\"npm:@bacnh85/pi-obsidian\",\"scope\":\"user\"}": "0.9.0",
-    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.1",
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.2",
     "{\"source\":\"npm:@heyhuynhgiabuu/pi-pretty\",\"scope\":\"user\"}": "0.10.0"
   },
   "modelThinkingLevels": {
     "llama.cpp/qwen3.8-27b": "off"
   },
-  "cacheWarming": "idle",
-  "sessionShareDestination": "auto",
+  "cacheWarming": "off",
   "enableSkillCommands": false,
   "quietStartup": true,
   "enableInstallTelemetry": false,

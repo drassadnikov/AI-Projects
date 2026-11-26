@@ -10,7 +10,11 @@
           "id": "qwen3.8-27b",
           "name": "Qwen 3.8 27B",
           "contextWindow": 262144,
-          "maxTokens": 32768,
+          "maxTokens": 65536,
+          "promptCache": {
+            "short": 4096,
+            "long": 16384
+          },
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -21,11 +25,18 @@
             "xhigh": "xhigh",
             "max": null
           },
-          "input": ["text", "image"],
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
         }
       ]
     }
   }
 }
-
